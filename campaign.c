@@ -39,10 +39,10 @@ struct command_xuid {
     uint64_t xuid;
 } __attribute__((packed));
 
-struct command_pt_mystery {
+struct command_turn_days {
     uint16_t len;
     uint16_t code;
-    uint16_t status;
+    uint16_t days;
 } __attribute__((packed));
 
 struct resp_status {
@@ -100,6 +100,14 @@ struct req_round_turn {
     uint16_t code;
     uint16_t round;
     uint16_t turn;
+} __attribute__((packed));
+
+struct req_round_turn_map {
+    uint16_t len;
+    uint16_t code;
+    uint16_t round;
+    uint16_t turn;
+    uint8_t map;
 } __attribute__((packed));
 
 struct resp_war_influence {
@@ -180,8 +188,7 @@ struct req_vt_list {
 
 struct shop_entry {
     uint16_t type;
-    uint16_t limit; // Purely visual, doesn't affect the ability to buy one
-    uint16_t a;
+    uint32_t limit;
     uint16_t cost;
     uint8_t padding;
 } __attribute__((packed));
@@ -315,9 +322,17 @@ struct resp_rank_count {
     uint8_t status;
     uint8_t padding0;
     uint32_t padding1;
-    uint32_t count;
-    uint32_t padding2;
-    uint32_t b; // Unused?
+    union {
+        struct {
+            uint32_t count;
+            uint32_t padding2;
+        } pt;
+        struct {
+            uint32_t place;
+            uint32_t count;
+        } loc;
+    };
+    uint32_t unknown;
 } __attribute__((packed));
 
 struct req_rank_values {
@@ -412,19 +427,61 @@ struct req_trade_vt {
 //    struct vt_list tx_vts;
 } __attribute__((packed));
 
+struct loc_mystery_entry {
+    uint16_t a;
+    uint16_t b;
+    uint32_t c; // Unused?
+    uint16_t d;
+    uint32_t e;
+    uint8_t f; // Faction?
+} __attribute__((packed)); // 15 bytes
+
+struct loc_mystery_list {
+    uint16_t len; // Should not exceed 128
+    struct loc_mystery_entry list[];
+} __attribute__((packed));
+
+struct resp_loc_mystery {
+    uint16_t len;
+    uint16_t code;
+    uint8_t status;
+    struct loc_mystery_list values;
+} __attribute__((packed));
+
 struct command_base cmd_liveness = {COMMAND_LEN(command_base), 0x1010};
 struct command_base cmd_xuidreq = {COMMAND_LEN(command_base), 0x1020};
 struct command_status cmd_connect = {COMMAND_LEN(command_status), 0x3013};
 struct command_status cmd_reject = {COMMAND_LEN(command_status), 0x3014};
 struct command_status cmd_wait = {COMMAND_LEN(command_status), 0x3015};
 
-struct command_pt_mystery cmd_pt_mystery = {COMMAND_LEN(command_pt_mystery), 0x4030};
+#define TURN_DAYS 7
+#define DAY_SECONDS 86400
+#define TURN_SECONDS (TURN_DAYS * DAY_SECONDS)
+
+struct command_turn_days cmd_turn_days = {COMMAND_LEN(command_turn_days), 0x4030, TURN_DAYS};
 
 #define RECV_BUF_LEN 5124
 #define MAX_CMD_LEN 2048 // Never seen a request from the client larger than this
 #define MAX_CONFIG_LINE_LEN 32
 
+
+
+enum GameType {
+    UnknownGame,
+    Brainbox,
+    PilotTest,
+    LineOfContact
+};
+
+char * GameType_string[] = {
+    "Unknown GameType",
+    "Brainbox",
+    "Pilot Test",
+    "Line of Contact"
+};
+
 struct config_data {
+    enum GameType game;
     struct sockaddr_in server_addr;
     char user[MAX_CONFIG_LINE_LEN];
     char pass[MAX_CONFIG_LINE_LEN];
@@ -539,8 +596,9 @@ void * recvcmd(void) {
         
         ssize_t read_ret = read(local_data->client_fd, local_data->recvbuf + local_data->recvbuf_len, RECV_BUF_LEN - local_data->recvbuf_len);
         if (!read_ret) {
-            logmsg("read() failed, socket prematurely closed");
-            client_handler_exit(1);
+            return NULL;
+//            logmsg("read() failed, socket prematurely closed");
+//            client_handler_exit(1);
         } else if (read_ret < 0) {
             char errmsg[256];
             strerror_r(errno, errmsg, 256);
@@ -572,8 +630,8 @@ void * recvcmd(void) {
     return cmd;
 }
 
-void handle_pt_unknown(void) {
-    logmsg("Request Pilot Test mystery command");
+void handle_turn_days(void) {
+    logmsg("Request Turn Days");
     
     char query[256];
     snprintf(query, sizeof(query),
@@ -586,13 +644,28 @@ void handle_pt_unknown(void) {
         client_handler_exit(1);
     }
     
-    sendcmd(&cmd_pt_mystery);
+    sendcmd(&cmd_turn_days);
+    logmsg("Response Turn Days: %d Days", cmd_turn_days.days);
+}
+
+void handle_loc_unknown(void) {
+    logmsg("Request LOC mystery command");
+    
+    size_t rowcount = 0;
+    struct resp_loc_mystery * loc_mystery = malloc(sizeof(struct resp_loc_mystery) + sizeof(struct loc_mystery_entry) * rowcount);
+    loc_mystery->code = 0x8041;
+    loc_mystery->status = 0;
+    loc_mystery->values.len = rowcount;
+    loc_mystery->len = COMMAND_LEN(resp_loc_mystery) + sizeof(struct loc_mystery_entry) * rowcount;
+
+    sendcmd(loc_mystery);
+    free(loc_mystery);
 }
 
 void handle_campaign_period(void) {
     logmsg("Request campaign period");
     
-    if (mysql_query(local_data->sqlcon, "SELECT round, turn, (UNIX_TIMESTAMP(period) - UNIX_TIMESTAMP(NOW())) FROM wartide ORDER BY round DESC, turn DESC LIMIT 1;")) {
+    if (mysql_query(local_data->sqlcon, "SELECT round, turn, (UNIX_TIMESTAMP(period) - UNIX_TIMESTAMP(NOW())) FROM settings ORDER BY round DESC, turn DESC LIMIT 1;")) {
         logmsg("Failed to query campaign period, got error: %s", mysql_error(local_data->sqlcon));
         client_handler_exit(1);
     }
@@ -641,6 +714,8 @@ void handle_campaign_period(void) {
         client_handler_exit(1);
     }
     
+    period.seconds += (8 - period.turn) * TURN_SECONDS;
+    
     logmsg("Campaign period response: Round %d, Turn %d, Seconds %d", period.round, period.turn, period.seconds);
     
     sendcmd(&period);
@@ -649,6 +724,7 @@ void handle_campaign_period(void) {
 void handle_vt_potential_cost(void) {
     logmsg("Request VT potential cost");
     
+    /*
     if (mysql_query(local_data->sqlcon, "SELECT type, vtpts FROM shop WHERE vtpts IS NOT NULL;")) {
         logmsg("Failed to query VT potential cost, got error: %s", mysql_error(local_data->sqlcon));
         client_handler_exit(1);
@@ -666,8 +742,10 @@ void handle_vt_potential_cost(void) {
         mysql_free_result(sqlres);
         client_handler_exit(1);
     }
-
-    size_t rowcount = mysql_num_rows(sqlres);    
+    
+    size_t rowcount = mysql_num_rows(sqlres);
+    */
+    size_t rowcount = 28;
     struct resp_vt_potential_cost * potentialcost = malloc(sizeof(struct resp_vt_potential_cost) + sizeof(struct vt_potential_cost_entry) * rowcount);
     potentialcost->code = 0x2049;
     potentialcost->status = 0;
@@ -675,13 +753,13 @@ void handle_vt_potential_cost(void) {
     potentialcost->len = COMMAND_LEN(resp_vt_potential_cost) + sizeof(struct vt_potential_cost_entry) * rowcount;
         
     for (int i = 0; i < rowcount; i++) {
-        MYSQL_ROW row = mysql_fetch_row(sqlres);
+//        MYSQL_ROW row = mysql_fetch_row(sqlres);
         
-        potentialcost->costs[i].type = strtoul(row[0], NULL, 10);
-        potentialcost->costs[i].cost = strtoul(row[1], NULL, 10);
+        potentialcost->costs[i].type = i;//strtoul(row[0], NULL, 10);
+        potentialcost->costs[i].cost = 1;//strtoul(row[1], NULL, 10);
     }
 
-    mysql_free_result(sqlres);
+//    mysql_free_result(sqlres);
     
     logmsg("Potential cost response, %d entries", rowcount);
     
@@ -689,11 +767,16 @@ void handle_vt_potential_cost(void) {
     free(potentialcost); // Cleanup
 }
 
-void handle_war_generic(struct req_round_turn * war_status_in, int32_t factions[3]) {
+void handle_war_influence(void) {
+    struct req_round_turn * war_influence_in = (struct req_round_turn *)local_data->recvbuf;
+    logmsg("Request War Influence: Round %d, Turn %d", war_influence_in->round, war_influence_in->turn);
+    
     char query[256];
-    snprintf(query, sizeof(query),
-        "SELECT hsd, prf, rb FROM wartide WHERE round = %d AND turn = %d;",
-        war_status_in->round, war_status_in->turn);
+    if (war_influence_in->round) {
+        snprintf(query, sizeof(query), "SELECT hsd, prf, rb FROM wartide WHERE round = %d;", war_influence_in->round);
+    } else {
+        strncpy(query, "SELECT hsd, prf, rb FROM wartide WHERE (round) IN (SELECT MAX(round) FROM wartide);", sizeof(query));
+    }
 
     if (mysql_query(local_data->sqlcon, query)) {
         logmsg("Failed to query war influence message, got error: %s", mysql_error(local_data->sqlcon));
@@ -706,51 +789,54 @@ void handle_war_generic(struct req_round_turn * war_status_in, int32_t factions[
         client_handler_exit(1);
     }
     
-    int num_fields = mysql_num_fields(sqlres);
-    if (num_fields != 3) {
-        logmsg("Incorrect number of fields (%d) in war influence", num_fields);
-        mysql_free_result(sqlres);
-        client_handler_exit(1);
+    int rb_exist = war_influence_in->turn >= 3;
+    
+    double hsd = 0.0;
+    double prf = 0.0;
+    double rb = 0.0;
+    
+    uint64_t rowcount = mysql_num_rows(sqlres);
+    for (int i = 0; i < rowcount; i++) {
+        MYSQL_ROW row = mysql_fetch_row(sqlres);
+        int hsd_map = strtoul(row[0], NULL, 10);
+        int prf_map = strtoul(row[1], NULL, 10);
+        int rb_map  = strtoul(row[2], NULL, 10);
+        
+        if (hsd_map > prf_map && hsd_map > rb_map) {
+            hsd++;
+        } else if (prf_map > hsd_map && prf_map > rb_map) {
+            prf++;
+        } else if (rb_map > prf_map && rb_map > hsd_map) {
+            rb++;
+        }
     }
-    
-    MYSQL_ROW row = mysql_fetch_row(sqlres);
-    if (!row || !row[0] || !row[1] || !row[2]) {
-        logmsg("Failed to get row from war influence, got error: %s", mysql_error(local_data->sqlcon));
-        mysql_free_result(sqlres);
-        client_handler_exit(1);
+
+    if (!rowcount) {
+        hsd = 1.0;
+        prf = 1.0;
+        if (rb_exist) rb = 1.0;
+    } else if (war_influence_in->turn == 3) {
+        // This little hack ensures that RB starts with roughly 1/3 map control on turn 3
+        int compensation = 9 - rowcount;
+        rb += compensation > 3 ? 3 : compensation;
     }
-    
-    int rb_exist = war_status_in->turn >= 3;
-    
-    double hsd = strtoul(row[0], NULL, 10);
-    double prf = strtoul(row[1], NULL, 10);
-    double rb  = rb_exist ? strtoul(row[2], NULL, 10) : 0;
-    
+
     mysql_free_result(sqlres);
     
     double total = hsd + prf + rb;
     // Prevent divide by zero
     if (!(int)total) total++;
     
-    factions[0] = hsd / total * 100.0;
-    factions[1] = prf / total * 100.0;
-    factions[2] = rb  / total * 100.0;
+    int32_t factions[3] = {
+        hsd / total * 100.0,
+        prf / total * 100.0,
+        rb  / total * 100.0
+    };
     
     // Make sure all 3 values sum to 100
     int32_t diff = 100 - (factions[0] + factions[1] + factions[2]);
 
-    logmsg("War influence response: Turn %d, HSD: %d, PRF: %d, RB: %d, Diff: %d",
-        war_status_in->turn, factions[0], factions[1], factions[2], diff);
-
     factions[rb_exist ? 2 : 1] += diff;
-}
-
-void handle_war_influence(void) {
-    struct req_round_turn * war_influence_in = (struct req_round_turn *)local_data->recvbuf;
-    logmsg("Request war influence: Round %d, Turn %d", war_influence_in->round, war_influence_in->turn);
-    
-    int32_t factions[3];
-    handle_war_generic(war_influence_in, factions);
 
     struct resp_war_influence war_influence = {COMMAND_LEN(resp_war_influence), 0x2032};
     war_influence.hsd = factions[0];
@@ -758,21 +844,77 @@ void handle_war_influence(void) {
     war_influence.rb  = factions[2];
     
     sendcmd(&war_influence);
+    logmsg("War influence response: HSD: %d, PRF: %d, RB: %d, Diff: %d",
+        factions[0], factions[1], factions[2], diff);
 }
 
 void handle_war_tide(void) {
-    struct req_round_turn * war_tide_in = (struct req_round_turn *)local_data->recvbuf;
-    logmsg("Request War Tide: Round %d, Turn %d", war_tide_in->round, war_tide_in->turn);
+    struct req_round_turn_map * war_tide_in = (struct req_round_turn_map *)local_data->recvbuf;
+    logmsg("Request War Tide: Round %d, Turn %d, Map %d", war_tide_in->round, war_tide_in->turn, war_tide_in->map);
     
-    int32_t factions[3];
-    handle_war_generic(war_tide_in, factions);
+    int map_id = war_tide_in->map + (war_tide_in->turn - 1) * 3;
+    
+    char query[256];
+    snprintf(query, sizeof(query),
+        "SELECT hsd, prf, rb FROM wartide WHERE round = %d AND map = %d;",
+        war_tide_in->round, map_id);
+
+    if (mysql_query(local_data->sqlcon, query)) {
+        logmsg("Failed to query war tide, got error: %s", mysql_error(local_data->sqlcon));
+        client_handler_exit(1);
+    }
+    
+    MYSQL_RES * sqlres;
+    if (!(sqlres = mysql_store_result(local_data->sqlcon))) {
+        logmsg("Failed to get war tide, got error: %s", mysql_error(local_data->sqlcon));
+        client_handler_exit(1);
+    }
+    
+    int num_fields = mysql_num_fields(sqlres);
+    if (num_fields != 3) {
+        logmsg("Incorrect number of fields (%d) in war tide", num_fields);
+        mysql_free_result(sqlres);
+        client_handler_exit(1);
+    }
+
+    int rb_exist = war_tide_in->turn >= 3;
+
+    double hsd = 1.0;
+    double prf = 1.0;
+    double rb  = rb_exist ? 1.0 : 0.0;
+    
+    MYSQL_ROW row = mysql_fetch_row(sqlres);
+    if (row) {
+        hsd = strtoul(row[0], NULL, 10);
+        prf = strtoul(row[1], NULL, 10);
+        if (rb_exist) rb = strtoul(row[2], NULL, 10);
+    }
+    
+    mysql_free_result(sqlres);
+    
+    double total = hsd + prf + rb;
+    // Prevent divide by zero
+    if (!(int)total) total++;
+    
+    int32_t factions[3] = {
+        hsd / total * 100.0,
+        prf / total * 100.0,
+        rb  / total * 100.0
+    };
+    
+    // Make sure all 3 values sum to 100
+    int32_t diff = 100 - (factions[0] + factions[1] + factions[2]);
+
+    factions[rb_exist ? 2 : 1] += diff;
 
     struct resp_war_tide war_tide = {COMMAND_LEN(resp_war_tide), 0x2031};
     war_tide.hsd = factions[0];
     war_tide.prf = factions[1];
     war_tide.rb  = factions[2];
-    
-    sendcmd(&war_tide);
+
+    sendcmd(&war_tide);    
+    logmsg("War tide response: HSD: %d, PRF: %d, RB: %d, Diff: %d",
+        factions[0], factions[1], factions[2], diff);
 }
 
 void handle_round_points(void) {
@@ -821,7 +963,9 @@ void handle_free_message(void) {
         return;
     }
     
-    if (mysql_query(local_data->sqlcon, "SELECT freemsg FROM settings;")) {
+    snprintf(query, sizeof(query), "SELECT freemsg_%s FROM settings ORDER BY round DESC, turn DESC LIMIT 1;", local_data->language ? "en" : "jp");
+    
+    if (mysql_query(local_data->sqlcon, query)) {
         logmsg("Failed to query free message, got error: %s", mysql_error(local_data->sqlcon));
         client_handler_exit(1);
     }
@@ -840,13 +984,13 @@ void handle_free_message(void) {
     }
     
     MYSQL_ROW row = mysql_fetch_row(sqlres);
-    if (!row || !row[0]) {
+    if (!row) {
         logmsg("Failed to get row from free message, got error: %s", mysql_error(local_data->sqlcon));
         mysql_free_result(sqlres);
         client_handler_exit(1);
     }
     
-    char * rawmsg = row[0];
+    char * rawmsg = row[0] ? row[0] : "";
     
     size_t msg_len = 0;
     for (int i = 0; rawmsg[i]; msg_len += sizeof(uint16_t)) {
@@ -882,10 +1026,6 @@ void handle_free_message(void) {
             i += 3;
         }
     }
-    
-//    uint8_t * dbgmsg = (uint8_t *)freemsg->msg;
-//    for (int i = 0; i < msg_len; i++) logmsg("Data: %02X", dbgmsg[i]);
-//  TODO: Fix JP messages
 
     mysql_free_result(sqlres);
     
@@ -897,50 +1037,81 @@ void handle_free_message(void) {
 void handle_fixed_message(void) {
     logmsg("Request fixed message");
     
+    struct resp_fixedmsg fixedmsg = {COMMAND_LEN(resp_fixedmsg), 0x201B};
+    
     // No fixed messages for banned users
     if (local_data->banned) {
         logmsg("Disconnect banned user");
-        struct resp_fixedmsg fixedmsg = {COMMAND_LEN(resp_fixedmsg), 0x201B};
         sendcmd(&fixedmsg);
         return;
     }
     
-    if (mysql_query(local_data->sqlcon, "SELECT fixedmsg FROM settings;")) {
-        logmsg("Failed to query fixed message, got error: %s", mysql_error(local_data->sqlcon));
+    if (mysql_query(local_data->sqlcon, "SELECT round, turn, (UNIX_TIMESTAMP(period) - UNIX_TIMESTAMP(NOW())) FROM settings ORDER BY round DESC, turn DESC LIMIT 1;")) {
+        logmsg("Failed to query data for fixed message, got error: %s", mysql_error(local_data->sqlcon));
         client_handler_exit(1);
     }
     
     MYSQL_RES * sqlres;
     if (!(sqlres = mysql_store_result(local_data->sqlcon))) {
-        logmsg("Failed to get fixed message, got error: %s", mysql_error(local_data->sqlcon));
+        logmsg("Failed to get data for fixed message, got error: %s", mysql_error(local_data->sqlcon));
         client_handler_exit(1);
     }
     
     int num_fields = mysql_num_fields(sqlres);
-    if (num_fields != 1) {
-        logmsg("Incorrect number of fields (%d) in fixed message", num_fields);
+    if (num_fields != 3) {
+        logmsg("Incorrect number of fields (%d) in data for fixed message", num_fields);
         mysql_free_result(sqlres);
         client_handler_exit(1);
     }
     
     MYSQL_ROW row = mysql_fetch_row(sqlres);
-    if (!row || !row[0]) {
-        logmsg("Failed to get row from fixed message, got error: %s", mysql_error(local_data->sqlcon));
+    if (!row || !row[0] || !row[1] || !row[2]) {
+        logmsg("Failed to get row from data for fixed message, got error: %s", mysql_error(local_data->sqlcon));
         mysql_free_result(sqlres);
         client_handler_exit(1);
     }
-
-    uint16_t msg_bits = strtoul(row[0], NULL, 10);
-    mysql_free_result(sqlres);
-
-    logmsg("Fixed messages: %04X", msg_bits);
-
-    struct resp_fixedmsg fixedmsg = {.code = 0x201B};
     
-    for (int i = 0; i < 16; i++) {
-        if (msg_bits & (1 << i)) {
-            fixedmsg.msg[fixedmsg.msg_len++] = i;
+    int round   = strtoul(row[0], NULL, 10);
+    int turn    = strtoul(row[1], NULL, 10);
+    long period = strtoul(row[2], NULL, 10);
+    
+    mysql_free_result(sqlres);
+    
+    if (!local_data->faction) {
+        if (turn == 1) {
+            // A new round has begun, pick a faction
+            fixedmsg.msg[fixedmsg.msg_len++] = 0;
+        } else {
+            // You can now transfer to another faction
+            fixedmsg.msg[fixedmsg.msg_len++] = 8;
         }
+    }
+    
+    if (turn > 1 && period > 5 * DAY_SECONDS) {
+        // A new turn has begun
+        fixedmsg.msg[fixedmsg.msg_len++] = 1;
+    }
+    
+    if (period < 2 * DAY_SECONDS) {
+        if (turn == 8) {
+            if (period < DAY_SECONDS) {
+                // Round is over
+                fixedmsg.msg[fixedmsg.msg_len++] = 4;
+            }
+            // Time remaining in round
+            fixedmsg.msg[fixedmsg.msg_len++] = 3;
+        } else {
+            // Time remaining in turn
+            fixedmsg.msg[fixedmsg.msg_len++] = 2;
+        }
+    }
+    
+    if (turn == 3) {
+        // RB appears
+        fixedmsg.msg[fixedmsg.msg_len++] = 7;
+    } else if (turn == 5) {
+        // Jar appears
+        fixedmsg.msg[fixedmsg.msg_len++] = 10;
     }
 
     fixedmsg.len = COMMAND_LEN(resp_fixedmsg) + fixedmsg.msg_len;
@@ -1055,8 +1226,9 @@ void handle_set_user_info(void) {
     char pilot_escape[2 * PILOT_DATA_SIZE + 1];
     mysql_real_escape_string(local_data->sqlcon, pilot_escape, set_user_info_in->data, PILOT_DATA_SIZE);
     
-    char query[2 * PILOT_DATA_SIZE + 256];
-    size_t query_len = snprintf(query, sizeof(query),
+    size_t query_max_len = 2 * PILOT_DATA_SIZE + 256;
+    char query[query_max_len];
+    size_t query_len = snprintf(query, query_max_len,
         "UPDATE accounts SET pilot = '%s' WHERE xuid = CONV('%016lX', 16, 10);",
         pilot_escape, local_data->xuid);
     
@@ -1426,6 +1598,11 @@ void handle_vt_capture(void) {
         uint16_t type = vt_capture_in->vts.list[i].type;
         uint32_t serial = vt_capture_in->vts.list[i].serial;
         
+        if (!serial) {
+            logmsg("Skipping VT type %d with null serial", type);
+            continue;
+        }
+        
         char query[256];
         snprintf(query, sizeof(query),
             "INSERT INTO garage (type, serial, xuid, faction) VALUES (%d, %d, CONV('%016lX', 16, 10), %d) ON DUPLICATE KEY UPDATE sortied = 0, faction = %d, xuid = CONV('%016lX', 16, 10);",
@@ -1459,7 +1636,7 @@ void handle_shop_list(void) {
     
     char query[512];
     snprintf(query, sizeof(query),
-    "SELECT shop.type, cost, IFNULL(vtlimit - number_owned, vtlimit) FROM shop LEFT JOIN (SELECT type, COUNT(serial) AS number_owned FROM garage GROUP BY type) owned ON shop.type = owned.type WHERE faction = %d AND IFNULL(vtlimit - number_owned, 1) > 0 AND turn <= (SELECT turn FROM wartide ORDER BY round DESC, turn DESC LIMIT 1);",
+    "SELECT shop.type, cost, IFNULL(vtlimit - number_owned, vtlimit) FROM shop LEFT JOIN (SELECT type, COUNT(serial) AS number_owned FROM garage GROUP BY type) owned ON shop.type = owned.type WHERE faction = %d AND IFNULL(vtlimit - number_owned, 1) > 0 AND turn <= (SELECT turn FROM settings ORDER BY round DESC, turn DESC LIMIT 1);",
         local_data->faction);
     
     if (mysql_query(local_data->sqlcon, query)) {
@@ -1492,9 +1669,8 @@ void handle_shop_list(void) {
         row = mysql_fetch_row(sqlres);
         shop_list->list[i].type  = strtoul(row[0], NULL, 10);
         shop_list->list[i].cost  = strtoul(row[1], NULL, 10);
-        shop_list->list[i].limit = row[2] ? strtoul(row[2], NULL, 10) : 0;
+        shop_list->list[i].limit = row[2] ? strtoul(row[2], NULL, 10) : -1;
         
-        shop_list->list[i].a = 0;
         shop_list->list[i].padding = 0;
     }
     
@@ -1568,6 +1744,8 @@ void handle_add_mission_point(void) {
         add_mission_point_in->turn, add_mission_point_in->map,
         add_mission_point_in->points, get_faction(add_mission_point_in->faction));
 
+    int map_id = add_mission_point_in->map + (add_mission_point_in->turn - 1) * 3;
+
     struct resp_status add_mission_point = {COMMAND_LEN(resp_status), 0x6027};
         
     char * faction = NULL;
@@ -1584,8 +1762,12 @@ void handle_add_mission_point(void) {
 
     char query[256];
     snprintf(query, sizeof(query),
-        "UPDATE wartide SET %s = %s + %d WHERE round = %d AND turn = %d;",
-        faction, faction, add_mission_point_in->points, add_mission_point_in->round, add_mission_point_in->turn);
+        // The default points value is 300 so we add that to the actual points gained on insertion
+        "INSERT INTO wartide (round, map, %s) VALUES(%d, %d, %d + 300) ON DUPLICATE KEY UPDATE %s = %s + %d;",
+        faction,
+        add_mission_point_in->round, map_id, add_mission_point_in->points,
+        faction, faction, add_mission_point_in->points
+    );
     
     if (mysql_query(local_data->sqlcon, query)) {
         logmsg("Failed to update wartide, got error: %s", mysql_error(local_data->sqlcon));
@@ -1611,17 +1793,18 @@ void handle_message_post(void) {
     sendcmd(&message_post);
 }
 
-void handle_rank_count(uint32_t * count, uint16_t round, uint16_t turn, uint8_t category, uint8_t faction) {
-    char turn_query[32];
-    snprintf(turn_query, sizeof(turn_query), "AND turn = %d", turn);
+void handle_rank_count(uint32_t * count, uint32_t * place, uint16_t round, uint16_t turn, uint8_t category, uint8_t faction) {
+    char turn_query[32] = "";
+    if (turn) snprintf(turn_query, sizeof(turn_query), "AND turn = %d", turn);
 
-    char faction_query[64];
-    snprintf(faction_query, sizeof(faction_query), "AND faction = %d", faction);
 
-    char query[256];
+    char faction_query[64] = "";
+    if (faction) snprintf(faction_query, sizeof(faction_query), "AND faction = %d", faction);
+
+    char query[512];
     snprintf(query, sizeof(query),
         "SELECT COUNT(*) FROM (SELECT 0 FROM leaderboard WHERE round = %d %s %s GROUP BY xuid) lb;",
-        round, turn ? turn_query : "", faction ? faction_query : "");
+        round, turn_query, faction_query);
 
     if (mysql_query(local_data->sqlcon, query)) {
         logmsg("Failed to query rank index, got error: %s", mysql_error(local_data->sqlcon));
@@ -1643,12 +1826,67 @@ void handle_rank_count(uint32_t * count, uint16_t round, uint16_t turn, uint8_t 
     
     MYSQL_ROW row = mysql_fetch_row(sqlres);
     if (!row || !row[0]) {
-        logmsg("Failed to get row from rank index, got error: %s", mysql_error(local_data->sqlcon));
+        logmsg("Failed to get row from rank index");
         mysql_free_result(sqlres);
         client_handler_exit(1);
     }
 
     *count = strtoul(row[0], NULL, 10);
+    mysql_free_result(sqlres);
+
+    // Don't compute the place
+    if (!place) return;
+    
+    char * category_query = NULL;
+    switch (category) {
+    case 1: category_query = "FLOOR(SUM(stat1) / (SUM(stat2) + 1) * 1000)"; break; // Accuracy
+    case 3: category_query = "SUM(stat4)";                                  break; // Points for Enemies Destroyed
+    case 5: category_query = "FLOOR(SUM(stat6) / SUM(stat7) * 1000)";       break; // Mission Victories
+    case 6: category_query = "SUM(stat8)";                                  break; // Number of Occupations
+    
+    case 2: category_query = "SUM(stat3)";                                  break; // Number of Enemies Destroyed
+    case 4: category_query = "SUM(stat5)";                                  break; // Number of VTs Lost
+    case 7: category_query = "SUM(stat9)";                                  break; // Number of VTs Captured
+    case 8: category_query = "SUM(stat10)";                                 break; // Number of Tippings
+    default:
+        logmsg("Unknown category %d", category);
+        client_handler_exit(1);
+    }
+    
+    snprintf(query, sizeof(query),
+        "SELECT `rank` FROM (SELECT xuid, ROW_NUMBER() OVER(ORDER BY score DESC) `rank` FROM (SELECT xuid, %s AS score FROM leaderboard WHERE round = %d %s %s GROUP BY xuid) as lb) as lb_rank WHERE xuid = CONV('%016lX', 16, 10);",
+        category_query,
+        round,
+        turn_query,
+        faction_query,
+        local_data->xuid
+    );
+    
+    if (mysql_query(local_data->sqlcon, query)) {
+        logmsg("Failed to query rank place, got error: %s", mysql_error(local_data->sqlcon));
+        client_handler_exit(1);
+    }
+    
+    if (!(sqlres = mysql_store_result(local_data->sqlcon))) {
+        logmsg("Failed to get rank place, got error: %s", mysql_error(local_data->sqlcon));
+        client_handler_exit(1);
+    }
+    
+    num_fields = mysql_num_fields(sqlres);
+    if (num_fields != 1) {
+        logmsg("Incorrect number of fields (%d) in rank place", num_fields);
+        mysql_free_result(sqlres);
+        client_handler_exit(1);
+    }
+    
+    row = mysql_fetch_row(sqlres);
+    if (!row || !row[0]) {
+        *place = 0; // User wasn't ranked
+        mysql_free_result(sqlres);
+        return;
+    }
+    
+    *place = strtoul(row[0], NULL, 10);
     mysql_free_result(sqlres);
 }
 
@@ -1658,30 +1896,45 @@ void handle_rank_count_global(void) {
         rank_count_global_in->round, rank_count_global_in->turn, rank_count_global_in->category);
         
     struct resp_rank_count rank_count = {COMMAND_LEN(resp_rank_count), 0x2061};
-    uint32_t count;
-    handle_rank_count(&count, rank_count_global_in->round, rank_count_global_in->turn, rank_count_global_in->category, 0);
-    rank_count.count = count;
+    uint32_t count, place;
+    handle_rank_count(&count, &place, rank_count_global_in->round, rank_count_global_in->turn, rank_count_global_in->category, 0);
     
-    logmsg("Rank index global response: Count %d", rank_count.count);
+    if (config.game == LineOfContact) {
+        rank_count.loc.count = count;
+        rank_count.loc.place = place;
+    } else {
+        rank_count.pt.count = count;
+    }
+    
+    logmsg("Rank index global response: Count %d, Place %d", count, place);
     sendcmd(&rank_count);
 }
 
 void handle_rank_count_faction(void) {
     struct req_rank_count_faction * rank_count_faction_in = (struct req_rank_count_faction *)local_data->recvbuf;
 
-    rank_count_faction_in->faction++; // For some reason the game returns "faction - 1", so correct that here
+    if (config.game != LineOfContact) {
+        // For some reason the PilotTest returns "faction - 1", so correct that here
+        rank_count_faction_in->faction++;
+    }
 
     logmsg("Request rank index faction: Round %d, Turn, %d, Category %d, Faction \"%s\"",
         rank_count_faction_in->round, rank_count_faction_in->turn,
         rank_count_faction_in->category, get_faction(rank_count_faction_in->faction));
 
     struct resp_rank_count rank_count = {COMMAND_LEN(resp_rank_count), 0x2062};
-    uint32_t count;
-    handle_rank_count(&count, rank_count_faction_in->round, rank_count_faction_in->turn,
+    uint32_t count, place;
+    handle_rank_count(&count, &place, rank_count_faction_in->round, rank_count_faction_in->turn,
         rank_count_faction_in->category, rank_count_faction_in->faction);
-    rank_count.count = count;
+
+    if (config.game == LineOfContact) {
+        rank_count.loc.count = count;
+        rank_count.loc.place = place;
+    } else {
+        rank_count.pt.count = count;
+    }
     
-    logmsg("Rank index faction response: Count %d", rank_count.count);
+    logmsg("Rank index faction response: Count %d, Place %d", count, place);
     sendcmd(&rank_count);
 }
 
@@ -1690,10 +1943,12 @@ void handle_rank_count_categories(void) {
     logmsg("Request rank count categories: Round %d, Turn %d", rank_count_categories_in->round, rank_count_categories_in->turn);
     
     struct resp_rank_count_categories rank_count_categories = {COMMAND_LEN(resp_rank_count_categories), 0x2063};
-    
+
+    uint32_t count;
+    handle_rank_count(&count, NULL, rank_count_categories_in->round, rank_count_categories_in->turn, 1, 0);    
+
+    // This will be the same response for all 8 categories
     for (int i = 0; i < 8; i++) {
-        uint32_t count;
-        handle_rank_count(&count, rank_count_categories_in->round, rank_count_categories_in->turn, i + 1, 0);
         rank_count_categories.count[i] = count;
     }
 
@@ -1859,13 +2114,14 @@ bool wait_for_partner(uint16_t code, uint32_t token) {
     
     // Wait for trade partner to make their request
     if (!complete && trade_slot >= 0) {
-        for (int i = 0; i <= 2 && !complete; i++) {
+        const int wait_seconds = 5;
+        for (int i = 0; i <= wait_seconds && !complete; i++) {
             sleep(1);
             
             pthread_mutex_lock(&trade_mtx);
             complete = trades[trade_slot].state == trade_state_complete;
             // Cleanup on the last iteration of the wait loop
-            if (i == 2 || complete) trades[trade_slot].state = trade_state_idle;
+            if (i == wait_seconds || complete) trades[trade_slot].state = trade_state_idle;
             pthread_mutex_unlock(&trade_mtx);
         }
         
@@ -1900,8 +2156,9 @@ void handle_trade_user_info(void) {
     char pilot_escape[2 * PILOT_DATA_SIZE + 1];
     mysql_real_escape_string(local_data->sqlcon, pilot_escape, trade_user_info_in->data, PILOT_DATA_SIZE);
     
-    char query[2 * PILOT_DATA_SIZE + 256];
-    size_t query_len = snprintf(query, sizeof(query),
+    size_t query_max_len = 2 * PILOT_DATA_SIZE + 256;
+    char query[query_max_len];
+    size_t query_len = snprintf(query, query_max_len,
         "UPDATE accounts SET pilot = '%s' WHERE xuid = CONV('%016lX', 16, 10);",
         pilot_escape, local_data->xuid);
     
@@ -2003,7 +2260,10 @@ void * client_handler(void * client_fd) {
     sendcmd(&cmd_liveness);
     {
         struct command_base * liveness = recvcmd();
-        if (liveness->code != 0x2010 || liveness->len) {
+        if (!liveness) {
+            logmsg("No liveness response recieved");
+            client_handler_exit(1);
+        } else if (liveness->code != 0x2010 || liveness->len) {
             logmsg("Invalid liveness response: code %04X, length %d", liveness->code, liveness->len);
             client_handler_exit(1);
         }
@@ -2013,7 +2273,10 @@ void * client_handler(void * client_fd) {
     sendcmd(&cmd_xuidreq);
     {
         struct command_xuid * xuidreq = recvcmd();
-        if (xuidreq->code != 0x2020 || xuidreq->len != COMMAND_LEN(command_xuid)) {
+        if (!xuidreq) {
+            logmsg("No xuid response recieved");
+            client_handler_exit(1);
+        } else if (xuidreq->code != 0x2020 || xuidreq->len != COMMAND_LEN(command_xuid)) {
             logmsg("Invalid xuid response: code %04X, length %d", xuidreq->code, xuidreq->len);
             client_handler_exit(1);
         }
@@ -2081,96 +2344,101 @@ void * client_handler(void * client_fd) {
     
     // Ask client to send it's request
     sendcmd(&cmd_connect);
-    struct command_base * req = recvcmd();
-
-    switch (req->code) {
-    // War Management
-    case 0x1030: handle_campaign_period();      break;
-    case 0x1031: handle_war_tide();             break;
-    case 0x1032: handle_war_influence();        break;
-    case 0x1028: handle_round_points();         break;
-    
-    // Mission Management
-    case 0x1090: handle_analyze();              break;
-    case 0x5026: handle_add_user_point();       break;
-    case 0x5027: handle_add_mission_point();    break;
-    
-    // Server MOTDs
-    case 0x101A: handle_free_message();         break;
-    case 0x101B: handle_fixed_message();        break;
-    
-    // Pilot Data
-    case 0x1021: handle_get_user_info();        break;
-    case 0x5022: handle_new_user_info();        break;
-    case 0x5024: handle_set_user_info();        break;
-    case 0x1023: handle_del_user_info();        break;
-    case 0x5025: handle_set_user_faction();     break;
-    
-    // Garage Management
-    case 0x1040: handle_vt_owned();             break;
-    case 0x1042: handle_vt_add();               break;
-    case 0x1044: handle_vt_del();               break;
-    case 0x1046: handle_vt_capture();           break;
-    case 0x1047: handle_vt_sortie();            break;
-    case 0x3047: handle_vt_return();            break;
-
-    // Shop
-    case 0x1041: handle_shop_list();            break;
-    case 0x1049: handle_vt_potential_cost();    break;
-    
-    // Message Board
-    case 0x1050: handle_message_count();        break;
-    case 0x1052: handle_message_post();         break;
-    
-    // Leaderboard
-    case 0x1060: handle_rank_values();          break;
-    case 0x1061: handle_rank_count_global();    break;
-    case 0x1062: handle_rank_count_faction();   break;
-    case 0x1063: handle_rank_count_categories();break;
-    
-    // Awards
-    case 0x5041: handle_awards_available();     break;
-    
-    // Trading
-    case 0x104A: handle_trade_token();          break;
-    case 0x104B: handle_trade_user_info();      break;
-    case 0x1045: handle_trade_vt();             break;
-    
-    // Unknown Command
-    case 0x3030: handle_pt_unknown();           break;
-    default:
-        logmsg("Unknown request %04X, length %d", req->code, req->len);
+    struct command_base * req;
+    while (req = recvcmd()) {
+        switch (req->code) {
+        // War Management
+        case 0x3030: handle_turn_days();            break;
+        case 0x1030: handle_campaign_period();      break;
+        case 0x1031: handle_war_tide();             break;
+        case 0x1032: handle_war_influence();        break;
+        case 0x1028: handle_round_points();         break;
         
-        uint16_t buflen = local_data->recvbuf_len;
-        if (buflen > 64); buflen = 64;
+        // Mission Management
+        case 0x1090: handle_analyze();              break;
+        case 0x5026: handle_add_user_point();       break;
+        case 0x5027: handle_add_mission_point();    break;
         
-        uint8_t buffer[256];
-        for (int i = 0; i < buflen; i++) {
-            sprintf(buffer + (3 * i), " %02X", local_data->recvbuf[i]);
+        // Server MOTDs
+        case 0x101A: handle_free_message();         break;
+        case 0x101B: handle_fixed_message();        break;
+        
+        // Pilot Data
+        case 0x1021: handle_get_user_info();        break;
+        case 0x5022: handle_new_user_info();        break;
+        case 0x5024: handle_set_user_info();        break;
+        case 0x1023: handle_del_user_info();        break;
+        case 0x5025: handle_set_user_faction();     break;
+        
+        // Garage Management
+        case 0x1040: handle_vt_owned();             break;
+        case 0x1042: handle_vt_add();               break;
+        case 0x1044: handle_vt_del();               break;
+        case 0x1046: handle_vt_capture();           break;
+        case 0x1047: handle_vt_sortie();            break;
+        case 0x3047: handle_vt_return();            break;
+
+        // Shop
+        case 0x1041: handle_shop_list();            break;
+        case 0x1049: handle_vt_potential_cost();    break;
+        
+        // Message Board
+        case 0x1050: handle_message_count();        break;
+        case 0x1052: handle_message_post();         break;
+        
+        // Leaderboard
+        case 0x1060: handle_rank_values();          break;
+        case 0x1061: handle_rank_count_global();    break;
+        case 0x1062: handle_rank_count_faction();   break;
+        case 0x1063: handle_rank_count_categories();break;
+        
+        // Awards
+        case 0x5041: handle_awards_available();     break;
+        
+        // Trading
+        case 0x104A: handle_trade_token();          break;
+        case 0x104B: handle_trade_user_info();      break;
+        case 0x1045: handle_trade_vt();             break;
+        
+        // Unknown Command
+        case 0x7041: handle_loc_unknown();          break;
+        default:
+            logmsg("Unknown request %04X, length %d", req->code, req->len);
+            
+            uint16_t buflen = local_data->recvbuf_len;
+            if (buflen > 64); buflen = 64;
+            
+            uint8_t buffer[256];
+            for (int i = 0; i < buflen; i++) {
+                sprintf(buffer + (3 * i), " %02X", local_data->recvbuf[i]);
+            }
+            logmsg("Buffer:%s", buffer);
+
+            client_handler_exit(1);
         }
-        logmsg("Buffer:%s", buffer);
-
-        client_handler_exit(1);
     }
-
+    
     client_handler_exit(0);
 }
 
+char freemsg_en[1024];
+char freemsg_jp[1024];
+char service_query[4096];
 unsigned int service_handler(MYSQL * sqlcon) {
-    if (mysql_query(sqlcon, "SELECT round, turn, UNIX_TIMESTAMP(period) - UNIX_TIMESTAMP(NOW()), period, hsd, prf, rb FROM wartide ORDER BY round DESC, turn DESC LIMIT 1;")) {
-        fprintf(stderr, "Failed to query wartide, got error: %s\n", mysql_error(sqlcon));
+    if (mysql_query(sqlcon, "SELECT round, turn, UNIX_TIMESTAMP(period) - UNIX_TIMESTAMP(NOW()), period, freemsg_en, freemsg_jp FROM settings ORDER BY round DESC, turn DESC LIMIT 1;")) {
+        fprintf(stderr, "Failed to query settings, got error: %s\n", mysql_error(sqlcon));
         return 60;
     }
     
     MYSQL_RES * sqlres;
     if (!(sqlres = mysql_store_result(sqlcon))) {
-        fprintf(stderr, "Failed to get wartide, got error: %s\n", mysql_error(sqlcon));
+        fprintf(stderr, "Failed to get settings, got error: %s\n", mysql_error(sqlcon));
         return 60;
     }
     
     int num_fields = mysql_num_fields(sqlres);
-    if (num_fields != 7) {
-        fprintf(stderr, "Incorrect number of fields (%d) in wartide result\n", num_fields);
+    if (num_fields != 6) {
+        fprintf(stderr, "Incorrect number of fields (%d) in settings result\n", num_fields);
         mysql_free_result(sqlres);
         return 60;
     }
@@ -2178,26 +2446,28 @@ unsigned int service_handler(MYSQL * sqlcon) {
     MYSQL_ROW row = mysql_fetch_row(sqlres);
     if (!row) {
         mysql_free_result(sqlres);
-        printf("No wartide entries, assuming fresh start\n");
+        printf("No settings entries, assuming fresh start\n");
     
-        if (mysql_query(sqlcon, "INSERT INTO wartide (round, turn, period, hsd, prf, rb) VALUES (1, 1, DATE_ADD(NOW(), INTERVAL 1 WEEK), 1000, 1000, 0);")) {
-            fprintf(stderr, "Failed to insert initial wartide, got error: %s\n", mysql_error(sqlcon));
+        if (mysql_query(sqlcon, "INSERT INTO settings (round, turn, period) VALUES (1, 1, DATE_ADD(NOW(), INTERVAL 1 WEEK));")) {
+            fprintf(stderr, "Failed to insert initial settings, got error: %s\n", mysql_error(sqlcon));
             return 60;
         }
     
-        return 7 * 86400; // Wait 1 week
+        return TURN_SECONDS;
     }
     
     uint16_t round = strtoul(row[0], NULL, 10);
     uint16_t turn = strtoul(row[1], NULL, 10);
     int32_t remaining = strtol(row[2], NULL, 10);
-    
+
     char period[32];
     strncpy(period, row[3], sizeof(period));
     
-    uint32_t hsd = strtoul(row[4], NULL, 10);
-    uint32_t prf = strtoul(row[5], NULL, 10);
-    uint32_t rb  = strtoul(row[6], NULL, 10);
+    if (row[4]) snprintf(freemsg_en, sizeof(freemsg_en), "\"%s\"", row[4]);
+    else strncpy(freemsg_en, "null", sizeof(freemsg_en));
+    
+    if (row[5]) snprintf(freemsg_jp, sizeof(freemsg_en), "\"%s\"", row[5]);
+    else strncpy(freemsg_jp, "null", sizeof(freemsg_jp));
     
     mysql_free_result(sqlres);
     
@@ -2210,21 +2480,11 @@ unsigned int service_handler(MYSQL * sqlcon) {
         turn++;
         
         if (turn == 3 || turn == 5) faction_reset = true;
-
-        // RB is now available, so give them the same number of points as the losing faction        
-        if (turn == 3) {
-            rb = 1000;
-//            rb = hsd < prf ? hsd : prf;
-        }
     } else {
         // Reset to defaults for new round
         faction_reset = true;
         round++;
         turn = 1;
-
-        hsd = 1000;
-        prf = 1000;
-        rb = 0;
     }
     
     if (faction_reset) {
@@ -2236,17 +2496,16 @@ unsigned int service_handler(MYSQL * sqlcon) {
         }
     }
 
-    char query[256];
-    snprintf(query, sizeof(query),
-        "INSERT INTO wartide (round, turn, period, hsd, prf, rb) VALUES (%d, %d, DATE_ADD(\"%s\", INTERVAL 1 WEEK), %d, %d, %d);",
-        round, turn, period, hsd, prf, rb);
+    snprintf(service_query, sizeof(service_query),
+        "INSERT INTO settings (round, turn, period, freemsg_en, freemsg_jp) VALUES (%d, %d, DATE_ADD(\"%s\", INTERVAL 1 WEEK), %s, %s);",
+        round, turn, period, freemsg_en, freemsg_jp);
         
-    if (mysql_query(sqlcon, query)) {
-        fprintf(stderr, "Failed to insert new wartide, got error: %s\n", mysql_error(sqlcon));
+    if (mysql_query(sqlcon, service_query)) {
+        fprintf(stderr, "Failed to insert new settings, got error: %s\n", mysql_error(sqlcon));
         return 60;
     }
 
-    return 7 * 86400; // Wait 1 week
+    return TURN_SECONDS;
 }
 
 void service_handle_cleanup(void * _) {
@@ -2309,8 +2568,24 @@ int load_config(char * path, struct config_data * cf) {
     cf->server_addr.sin_family = AF_INET;
     
     const char * whitespace = " \r\n";
-    
     char line[MAX_CONFIG_LINE_LEN];
+
+    cf->game = UnknownGame;
+    
+    fgets(line, MAX_CONFIG_LINE_LEN, conf);
+    line[strcspn(line, whitespace)] = '\0';
+    if (!strcmp(line, "Brainbox")) {
+        cf->game = Brainbox;
+    } else if (!strcmp(line, "PilotTest")) {
+        cf->game = PilotTest;
+    } else if (!strcmp(line, "LineOfContact")) {
+        cf->game = LineOfContact;
+    } else {
+        fprintf(stderr, "Unknown game type: %s\n", line);
+        fclose(conf);
+        return 1;
+    }
+    
     fgets(line, MAX_CONFIG_LINE_LEN, conf);
     line[strcspn(line, whitespace)] = '\0';
     
@@ -2365,6 +2640,8 @@ int main(int argc, char ** argv) {
     
     // Try and load a config file
     if (load_config(argv[1], &config)) return 1;
+    
+    printf("Game type is set to: %s\n", GameType_string[config.game]);
     
     printf("MySQL client version: %s\n", mysql_get_client_info());
     if (mysql_library_init(0, NULL, NULL)) {
