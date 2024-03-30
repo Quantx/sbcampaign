@@ -18,7 +18,7 @@
 
 const char * faction_str[] = {"N/A", "HSD", "PRF", "RB", "JAR", "ERR"};
 static inline const char * get_faction(uint8_t faction_id) {
-    if (faction_id > 6) faction_id = 6;
+    if (faction_id > 5) faction_id = 5;
     return faction_str[faction_id];
 }
 
@@ -457,14 +457,13 @@ struct command_status cmd_wait = {COMMAND_LEN(command_status), 0x3015};
 #define TURN_DAYS 7
 #define DAY_SECONDS 86400
 #define TURN_SECONDS (TURN_DAYS * DAY_SECONDS)
+#define NUMBER_OF_MAPS 24
 
 struct command_turn_days cmd_turn_days = {COMMAND_LEN(command_turn_days), 0x4030, TURN_DAYS};
 
 #define RECV_BUF_LEN 5124
 #define MAX_CMD_LEN 2048 // Never seen a request from the client larger than this
 #define MAX_CONFIG_LINE_LEN 32
-
-
 
 enum GameType {
     UnknownGame,
@@ -810,18 +809,19 @@ void handle_war_influence(void) {
             rb++;
         }
     }
-
-    if (!rowcount) {
-        hsd = 1.0;
-        prf = 1.0;
-        if (rb_exist) rb = 1.0;
-    } else if (war_influence_in->turn == 3) {
-        // This little hack ensures that RB starts with roughly 1/3 map control on turn 3
-        int compensation = 9 - rowcount;
-        rb += compensation > 3 ? 3 : compensation;
-    }
-
     mysql_free_result(sqlres);
+    
+    double unplayed = rowcount < NUMBER_OF_MAPS ? NUMBER_OF_MAPS - rowcount : 0.0;
+    if (rb_exist) {
+        unplayed /= 3.0;
+        hsd += unplayed;
+        prf += unplayed;
+        rb  += unplayed;
+    } else {
+        unplayed /= 2.0;
+        hsd += unplayed;
+        prf += unplayed;
+    }
     
     double total = hsd + prf + rb;
     // Prevent divide by zero
@@ -879,18 +879,20 @@ void handle_war_tide(void) {
 
     int rb_exist = war_tide_in->turn >= 3;
 
-    double hsd = 1.0;
-    double prf = 1.0;
-    double rb  = rb_exist ? 1.0 : 0.0;
+    // Give each faction some starting points so that early victories dont skew the pie-chart
+    double hsd = 300.0;
+    double prf = 300.0;
+    double rb  = 300.0;
     
     MYSQL_ROW row = mysql_fetch_row(sqlres);
     if (row) {
-        hsd = strtoul(row[0], NULL, 10);
-        prf = strtoul(row[1], NULL, 10);
-        if (rb_exist) rb = strtoul(row[2], NULL, 10);
+        hsd += strtoul(row[0], NULL, 10);
+        prf += strtoul(row[1], NULL, 10);
+        rb  += strtoul(row[2], NULL, 10);
     }
-    
     mysql_free_result(sqlres);
+    
+    if (!rb_exist) rb = 0.0;
     
     double total = hsd + prf + rb;
     // Prevent divide by zero
@@ -1251,19 +1253,29 @@ void handle_del_user_info(void) {
     logmsg("Request delete user info");
 
     struct resp_status del_user_info = {COMMAND_LEN(resp_status), 0x2023, 1};
-    
-    // Delete Pilot Data
+
     char query[256];
-    snprintf(query, sizeof(query), "UPDATE accounts SET faction = 0, pilot = NULL WHERE xuid = CONV('%016lX', 16, 10);", local_data->xuid);
+    
+    // Copy pilot to graveyard
+    snprintf(query, sizeof(query), "INSERT INTO graveyard (xuid, pilot, tod) SELECT xuid, pilot, NOW() FROM accounts WHERE xuid = CONV('%016lX', 16, 10);",
+        local_data->xuid);
     
     if (mysql_query(local_data->sqlcon, query)) {
-        logmsg("Failed to update delete user data, got error: %s", mysql_error(local_data->sqlcon));
+        logmsg("Failed to add pilot to the graveyard durring delete user data, got error: %s", mysql_error(local_data->sqlcon));
+    }
+    
+    // Delete Pilot Data
+    snprintf(query, sizeof(query), "UPDATE accounts SET faction = 0, pilot = NULL WHERE xuid = CONV('%016lX', 16, 10);",
+        local_data->xuid);
+    
+    if (mysql_query(local_data->sqlcon, query)) {
+        logmsg("Failed to delete user data, got error: %s", mysql_error(local_data->sqlcon));
         sendcmd(&del_user_info);
         return;
     }
     
     if (!mysql_affected_rows(local_data->sqlcon)) {
-        logmsg("Did not update delete user data, zero rows affected");
+        logmsg("Did not delete user data, zero rows affected");
         sendcmd(&del_user_info);
         return;
     }
@@ -1413,9 +1425,8 @@ void handle_vt_add(void) {
         
         char query[512];
         snprintf(query, sizeof(query),
-            "BEGIN; SELECT serial FROM shop WHERE type = %d FOR UPDATE; UPDATE shop SET serial = serial + %d WHERE type = %d; COMMIT;",
-            type,
-            quantity, type);
+            "BEGIN; SELECT serial FROM shop WHERE type = %d FOR UPDATE; UPDATE shop SET serial = serial + %d, vtstock = GREATEST(vtstock - %d, 0) WHERE type = %d; COMMIT;",
+            type, quantity, quantity, type);
     
         if (mysql_query(local_data->sqlcon, query)) {
             logmsg("Failed to update serials in add list, got error: %s", mysql_error(local_data->sqlcon));
@@ -1636,8 +1647,10 @@ void handle_shop_list(void) {
     
     char query[512];
     snprintf(query, sizeof(query),
-    "SELECT shop.type, cost, IFNULL(vtlimit - number_owned, vtlimit) FROM shop LEFT JOIN (SELECT type, COUNT(serial) AS number_owned FROM garage GROUP BY type) owned ON shop.type = owned.type WHERE faction = %d AND IFNULL(vtlimit - number_owned, 1) > 0 AND turn <= (SELECT turn FROM settings ORDER BY round DESC, turn DESC LIMIT 1);",
-        local_data->faction);
+        "SELECT type, cost, vtstock FROM shop WHERE (faction = %d %s) AND IFNULL(vtstock, 1) > 0 AND turn <= (SELECT turn FROM settings ORDER BY round DESC, turn DESC LIMIT 1);",
+        local_data->faction,
+        local_data->faction == 4 ? "OR type = 0 OR type = 1" : "" // Give Jar access to Vitzh and m-Vitzh
+    );
     
     if (mysql_query(local_data->sqlcon, query)) {
         logmsg("Failed to query shop list, got error: %s", mysql_error(local_data->sqlcon));
@@ -1762,8 +1775,7 @@ void handle_add_mission_point(void) {
 
     char query[256];
     snprintf(query, sizeof(query),
-        // The default points value is 300 so we add that to the actual points gained on insertion
-        "INSERT INTO wartide (round, map, %s) VALUES(%d, %d, %d + 300) ON DUPLICATE KEY UPDATE %s = %s + %d;",
+        "INSERT INTO wartide (round, map, %s) VALUES(%d, %d, %d) ON DUPLICATE KEY UPDATE %s = %s + %d;",
         faction,
         add_mission_point_in->round, map_id, add_mission_point_in->points,
         faction, faction, add_mission_point_in->points
@@ -2473,6 +2485,11 @@ unsigned int service_handler(MYSQL * sqlcon) {
     
     // Wait for period to expire
     if (remaining > 0) return remaining + 1;
+
+    if (mysql_query(sqlcon, "UPDATE shop SET vtstock = vtlimit;")) {
+        fprintf(stderr, "Failed to update shop vtstock, got error: %s\n", mysql_error(sqlcon));
+        return 60;
+    }
     
     bool faction_reset = false;
     
@@ -2496,10 +2513,10 @@ unsigned int service_handler(MYSQL * sqlcon) {
         }
     }
 
-    snprintf(service_query, sizeof(service_query),
+    snprintf(service_query, sizeof(service_query), // This needs to be the last call made
         "INSERT INTO settings (round, turn, period, freemsg_en, freemsg_jp) VALUES (%d, %d, DATE_ADD(\"%s\", INTERVAL 1 WEEK), %s, %s);",
         round, turn, period, freemsg_en, freemsg_jp);
-        
+    
     if (mysql_query(sqlcon, service_query)) {
         fprintf(stderr, "Failed to insert new settings, got error: %s\n", mysql_error(sqlcon));
         return 60;
