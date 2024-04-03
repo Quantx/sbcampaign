@@ -278,18 +278,21 @@ struct req_add_mission_point {
     uint8_t faction;
 } __attribute__((packed));
 
-struct req_turn_points {
+struct req_round_points {
     uint16_t len;
     uint16_t code;
-    uint16_t last_turn;
+    uint16_t round;
 } __attribute__((packed));
 
-struct resp_turn_points {
+struct resp_round_points {
     uint16_t len;
     uint16_t code;
     uint8_t status;
     uint32_t points;
-} __attribute__((packed));;
+    uint8_t hsd;
+    uint8_t prf;
+    uint8_t rb;
+} __attribute__((packed));
 
 struct resp_rank_count_categories {  
     uint16_t len;
@@ -920,15 +923,75 @@ void handle_war_tide(void) {
 }
 
 void handle_round_points(void) {
-    struct req_turn_points * turn_points_in = (struct req_turn_points *)local_data->recvbuf;
-    logmsg("Request end-of-round points: Last Round %d", turn_points_in->last_turn);
+    struct req_round_points * round_points_in = (struct req_round_points *)local_data->recvbuf;
+    logmsg("Request end-of-round points: Round %d", round_points_in->round);
     
-    struct resp_turn_points turn_points = {COMMAND_LEN(resp_turn_points), 0x2028};
+    char query[256];
+    snprintf(query, sizeof(query), "SELECT hsd, prf, rb FROM wartide WHERE round = %d;", round_points_in->round);
+
+    if (mysql_query(local_data->sqlcon, query)) {
+        logmsg("Failed to query battle status for round points, got error: %s", mysql_error(local_data->sqlcon));
+        client_handler_exit(1);
+    }
+    
+    MYSQL_RES * sqlres;
+    if (!(sqlres = mysql_store_result(local_data->sqlcon))) {
+        logmsg("Failed to get battle status for round points, got error: %s", mysql_error(local_data->sqlcon));
+        client_handler_exit(1);
+    }
+    
+    int hsd = 0;
+    int prf = 0;
+    int rb = 0;
+    
+    uint64_t rowcount = mysql_num_rows(sqlres);
+    for (int i = 0; i < rowcount; i++) {
+        MYSQL_ROW row = mysql_fetch_row(sqlres);
+        int hsd_map = strtoul(row[0], NULL, 10);
+        int prf_map = strtoul(row[1], NULL, 10);
+        int rb_map  = strtoul(row[2], NULL, 10);
+        
+        if (hsd_map > prf_map && hsd_map > rb_map) {
+            hsd++;
+        } else if (prf_map > hsd_map && prf_map > rb_map) {
+            prf++;
+        } else if (rb_map > prf_map && rb_map > hsd_map) {
+            rb++;
+        }
+    }
+    mysql_free_result(sqlres);
+    
+    struct resp_round_points round_points = {COMMAND_LEN(resp_round_points), 0x2028};
     // TODO: Fetch this dynamically from the DB
-    turn_points.points = 100000;
+    /*
+        0 = Annihilated
+        1 = 1st
+        2 = 2nd
+        3 = 3rd
+    */
+    round_points.points = 100000;
+    round_points.hsd = 3;
+    round_points.prf = 3;
+    round_points.rb  = 3;
     
-    logmsg("Round points response: %d Points", turn_points.points);
-    sendcmd(&turn_points);
+    if (hsd) {
+        if (hsd >= prf) round_points.hsd--;
+        if (hsd >= rb)  round_points.hsd--;
+    } else round_points.hsd = 0;
+
+    if (prf) {
+        if (prf >= hsd) round_points.prf--;
+        if (prf >= rb)  round_points.prf--;
+    } else round_points.prf = 0;
+    
+    if (rb) {
+        if (rb >= hsd) round_points.rb--;
+        if (rb >= prf) round_points.rb--;
+    } else round_points.rb = 0;
+    
+    logmsg("Round points response: %d Points, HSD: %d, PRF: %d, RB: %d, Diff: %d",
+        round_points.points, round_points.hsd, round_points.prf, round_points.rb);
+    sendcmd(&round_points);
 }
 
 void handle_free_message(void) {
