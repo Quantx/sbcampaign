@@ -1868,101 +1868,142 @@ void handle_message_post(void) {
     sendcmd(&message_post);
 }
 
+void get_category_query(uint8_t category, char ** category_query, char ** category_filter) {
+    switch (category) {
+    case 0: {
+        *category_query = "";
+        *category_filter = "";
+    } break;
+    case 1: { // Accuracy
+        *category_query = "(SUM(stat1) * 1000) as score, SUM(stat2) as scoreDiv";
+        *category_filter = "scoreDiv >= 100";
+    } break;
+    case 3: { // Points for Enemies Destroyed
+        *category_query = "SUM(stat4) as score, 1 as scoreDiv";
+        *category_filter = "score > 0";
+    } break;
+    case 5: { // Mission Victories
+        *category_query = "(SUM(stat6) * 1000) as score, SUM(stat7) as scoreDiv";
+        *category_filter = "scoreDiv >= 5";
+    } break;
+    case 6: { // Number of Occupations
+        *category_query = "SUM(stat8) as score, 1 as scoreDiv";
+        *category_filter = "score > 0";
+    } break;
+    
+    case 2: { // Number of Enemies Destroyed
+        *category_query = "SUM(stat3) as score, 1 as scoreDiv";
+        *category_filter = "score > 0";
+    } break;
+    case 4: { // Number of VTs Lost
+        *category_query = "SUM(stat5) as score, 1 as scoreDiv";
+        *category_filter = "score > 0";
+    } break;
+    case 7: { // Number of VTs Captured
+        *category_query = "SUM(stat9) as score, 1 as scoreDiv";
+        *category_filter = "score > 0";
+    } break;
+    case 8: { // Number of Tippings
+        *category_query = "SUM(stat10) as score, 1 as scoreDiv";
+        *category_filter = "score > 0";
+    } break;
+    default:
+        *category_query = NULL;
+        *category_filter = NULL;
+        logmsg("Unknown category %d", category);
+        client_handler_exit(1);
+    }
+}
+
 void handle_rank_count(uint32_t * count, uint32_t * place, uint16_t round, uint16_t turn, uint8_t category, uint8_t faction) {
     char turn_query[32] = "";
     if (turn) snprintf(turn_query, sizeof(turn_query), "AND turn = %d", turn);
 
-
     char faction_query[64] = "";
     if (faction) snprintf(faction_query, sizeof(faction_query), "AND faction = %d", faction);
 
+    char * category_query, * category_filter;
+    get_category_query(category, &category_query, &category_filter);
+
     char query[512];
-    snprintf(query, sizeof(query),
-        "SELECT COUNT(*) FROM (SELECT 0 FROM leaderboard WHERE round = %d %s %s GROUP BY xuid) lb;",
-        round, turn_query, faction_query);
+    if (count) {
+        snprintf(query, sizeof(query),
+            "SELECT COUNT(*) FROM (SELECT %s FROM leaderboard WHERE round = %d %s %s GROUP BY xuid) as lb WHERE %s",
+            category_query,
+            round,
+            turn_query,
+            faction_query,
+            category_filter
+        );
 
-    if (mysql_query(local_data->sqlcon, query)) {
-        logmsg("Failed to query rank index, got error: %s", mysql_error(local_data->sqlcon));
-        client_handler_exit(1);
-    }
-    
-    MYSQL_RES * sqlres;
-    if (!(sqlres = mysql_store_result(local_data->sqlcon))) {
-        logmsg("Failed to get rank index, got error: %s", mysql_error(local_data->sqlcon));
-        client_handler_exit(1);
-    }
-    
-    int num_fields = mysql_num_fields(sqlres);
-    if (num_fields != 1) {
-        logmsg("Incorrect number of fields (%d) in rank index", num_fields);
-        mysql_free_result(sqlres);
-        client_handler_exit(1);
-    }
-    
-    MYSQL_ROW row = mysql_fetch_row(sqlres);
-    if (!row || !row[0]) {
-        logmsg("Failed to get row from rank index");
-        mysql_free_result(sqlres);
-        client_handler_exit(1);
-    }
+        if (mysql_query(local_data->sqlcon, query)) {
+            logmsg("Failed to query rank index, got error: %s", mysql_error(local_data->sqlcon));
+            client_handler_exit(1);
+        }
+        
+        MYSQL_RES * sqlres;
+        if (!(sqlres = mysql_store_result(local_data->sqlcon))) {
+            logmsg("Failed to get rank index, got error: %s", mysql_error(local_data->sqlcon));
+            client_handler_exit(1);
+        }
+        
+        int num_fields = mysql_num_fields(sqlres);
+        if (num_fields != 1) {
+            logmsg("Incorrect number of fields (%d) in rank index", num_fields);
+            mysql_free_result(sqlres);
+            client_handler_exit(1);
+        }
+        
+        MYSQL_ROW row = mysql_fetch_row(sqlres);
+        if (!row || !row[0]) {
+            logmsg("Failed to get row from rank index");
+            mysql_free_result(sqlres);
+            client_handler_exit(1);
+        }
 
-    *count = strtoul(row[0], NULL, 10);
-    mysql_free_result(sqlres);
-
-    // Don't compute the place
-    if (!place) return;
-    
-    char * category_query = NULL;
-    switch (category) {
-    case 1: category_query = "FLOOR(SUM(stat1) / (SUM(stat2) + 1) * 1000)"; break; // Accuracy
-    case 3: category_query = "SUM(stat4)";                                  break; // Points for Enemies Destroyed
-    case 5: category_query = "FLOOR(SUM(stat6) / SUM(stat7) * 1000)";       break; // Mission Victories
-    case 6: category_query = "SUM(stat8)";                                  break; // Number of Occupations
-    
-    case 2: category_query = "SUM(stat3)";                                  break; // Number of Enemies Destroyed
-    case 4: category_query = "SUM(stat5)";                                  break; // Number of VTs Lost
-    case 7: category_query = "SUM(stat9)";                                  break; // Number of VTs Captured
-    case 8: category_query = "SUM(stat10)";                                 break; // Number of Tippings
-    default:
-        logmsg("Unknown category %d", category);
-        client_handler_exit(1);
-    }
-    
-    snprintf(query, sizeof(query),
-        "SELECT `rank` FROM (SELECT xuid, ROW_NUMBER() OVER(ORDER BY score DESC) `rank` FROM (SELECT xuid, %s AS score FROM leaderboard WHERE round = %d %s %s GROUP BY xuid) as lb) as lb_rank WHERE xuid = CONV('%016lX', 16, 10);",
-        category_query,
-        round,
-        turn_query,
-        faction_query,
-        local_data->xuid
-    );
-    
-    if (mysql_query(local_data->sqlcon, query)) {
-        logmsg("Failed to query rank place, got error: %s", mysql_error(local_data->sqlcon));
-        client_handler_exit(1);
-    }
-    
-    if (!(sqlres = mysql_store_result(local_data->sqlcon))) {
-        logmsg("Failed to get rank place, got error: %s", mysql_error(local_data->sqlcon));
-        client_handler_exit(1);
-    }
-    
-    num_fields = mysql_num_fields(sqlres);
-    if (num_fields != 1) {
-        logmsg("Incorrect number of fields (%d) in rank place", num_fields);
+        *count = strtoul(row[0], NULL, 10);
         mysql_free_result(sqlres);
-        client_handler_exit(1);
     }
     
-    row = mysql_fetch_row(sqlres);
-    if (!row || !row[0]) {
-        *place = 0; // User wasn't ranked
+    if (place) {
+        snprintf(query, sizeof(query),
+            "SELECT `rank` FROM (SELECT xuid, ROW_NUMBER() OVER(ORDER BY (score / scoreDiv) DESC) `rank` FROM (SELECT xuid, %s FROM leaderboard WHERE round = %d %s %s GROUP BY xuid) as lb WHERE %s) as lb_rank WHERE xuid = CONV('%016lX', 16, 10);",
+            category_query,
+            round,
+            turn_query,
+            faction_query,
+            category_filter,
+            local_data->xuid
+        );
+        
+        if (mysql_query(local_data->sqlcon, query)) {
+            logmsg("Failed to query rank place, got error: %s", mysql_error(local_data->sqlcon));
+            client_handler_exit(1);
+        }
+        
+        MYSQL_RES * sqlres;
+        if (!(sqlres = mysql_store_result(local_data->sqlcon))) {
+            logmsg("Failed to get rank place, got error: %s", mysql_error(local_data->sqlcon));
+            client_handler_exit(1);
+        }
+        
+        int num_fields = mysql_num_fields(sqlres);
+        if (num_fields != 1) {
+            logmsg("Incorrect number of fields (%d) in rank place", num_fields);
+            mysql_free_result(sqlres);
+            client_handler_exit(1);
+        }
+        
+        MYSQL_ROW row = mysql_fetch_row(sqlres);
+        if (!row || !row[0]) {
+            *place = 0; // User wasn't ranked
+            mysql_free_result(sqlres);
+            return;
+        }
+        
+        *place = strtoul(row[0], NULL, 10);
         mysql_free_result(sqlres);
-        return;
     }
-    
-    *place = strtoul(row[0], NULL, 10);
-    mysql_free_result(sqlres);
 }
 
 void handle_rank_count_global(void) {
@@ -2041,35 +2082,23 @@ void handle_rank_values(void) {
         rank_values_in->round, rank_values_in->turn, get_faction(rank_values_in->faction),
         rank_values_in->category, rank_values_in->start, rank_values_in->count);
     
-    char turn_query[32];
-    snprintf(turn_query, sizeof(turn_query), "AND leaderboard.turn = %d", rank_values_in->turn);
+    char turn_query[32] = "";
+    if (rank_values_in->turn) snprintf(turn_query, sizeof(turn_query), "AND leaderboard.turn = %d", rank_values_in->turn);
     
-    char faction_query[64];
-    snprintf(faction_query, sizeof(faction_query), "AND leaderboard.faction = %d", rank_values_in->faction);
+    char faction_query[64] = "";
+    if (rank_values_in->faction) snprintf(faction_query, sizeof(faction_query), "AND leaderboard.faction = %d", rank_values_in->faction);
     
-    char * category_query = NULL;
-    switch (rank_values_in->category) {
-    case 1: category_query = "FLOOR(SUM(stat1) / (SUM(stat2) + 1) * 1000)"; break; // Accuracy
-    case 3: category_query = "SUM(stat4)";                                  break; // Points for Enemies Destroyed
-    case 5: category_query = "FLOOR(SUM(stat6) / SUM(stat7) * 1000)";       break; // Mission Victories
-    case 6: category_query = "SUM(stat8)";                                  break; // Number of Occupations
-    
-    case 2: category_query = "SUM(stat3)";                                  break; // Number of Enemies Destroyed
-    case 4: category_query = "SUM(stat5)";                                  break; // Number of VTs Lost
-    case 7: category_query = "SUM(stat9)";                                  break; // Number of VTs Captured
-    case 8: category_query = "SUM(stat10)";                                 break; // Number of Tippings
-    default:
-        logmsg("Unknown category %d", rank_values_in->category);
-        client_handler_exit(1);
-    }
+    char * category_query, * category_filter;
+    get_category_query(rank_values_in->category, &category_query, &category_filter);
     
     char query[512];
     snprintf(query, sizeof(query),
-        "SELECT accounts.xname, accounts.pilot, (%s) AS res FROM leaderboard INNER JOIN accounts ON leaderboard.xuid = accounts.xuid WHERE leaderboard.round = %d %s %s GROUP BY leaderboard.xuid ORDER BY res DESC LIMIT %d, %d;",
+        "SELECT xname, pilot, FLOOR(score / scoreDiv) as res FROM (SELECT xuid, %s FROM leaderboard WHERE round = %d %s %s GROUP BY xuid) as lb INNER JOIN accounts ON lb.xuid = accounts.xuid WHERE %s ORDER BY res DESC LIMIT %d, %d;",
         category_query,
         rank_values_in->round,
-        rank_values_in->turn ? turn_query : "",
-        rank_values_in->faction ? faction_query : "",
+        turn_query,
+        faction_query,
+        category_filter,
         rank_values_in->start - 1, rank_values_in->count);
 
     if (mysql_query(local_data->sqlcon, query)) {
