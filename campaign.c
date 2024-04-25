@@ -374,13 +374,14 @@ struct resp_rank_values {
 struct award_entry {
     uint16_t round;
     uint16_t turn;
-    uint32_t a;
-    uint16_t b;
-    uint32_t c;
-} __attribute__((packed));
+    uint32_t a; // Unused
+    uint16_t vt;
+    uint32_t b;
+    uint8_t faction; // Faction
+} __attribute__((packed)); // 15 bytes
 
 struct award_list {
-    uint16_t len;
+    uint16_t len; // Max length is 128
     struct award_entry list[];
 } __attribute__((packed));
 
@@ -389,6 +390,73 @@ struct resp_award_available {
     uint16_t code;
     uint8_t status;
     struct award_list awards;
+} __attribute__((packed));
+
+struct req_award_points {
+    uint16_t len;
+    uint16_t code;
+    uint8_t is_turn;
+} __attribute__((packed));
+
+struct award_points_list {
+    uint16_t len;
+    uint32_t list[];
+} __attribute__((packed));
+
+struct resp_award_points {
+    uint16_t len;
+    uint16_t code;
+    uint8_t status;
+    uint8_t padding;
+    struct award_points_list points;
+} __attribute__((packed));
+
+struct req_award_ranks {
+    uint16_t len;
+    uint16_t code;
+    uint16_t round;
+    uint16_t turn;
+    uint8_t faction;
+} __attribute__((packed));
+
+struct award_ranks_entry {
+    uint8_t category; // Should be one of: 1, 3, 5, 6
+    uint32_t rank;
+    uint32_t a; // Unused
+    uint32_t b; // Unused
+} __attribute__((packed));
+
+struct award_ranks_list {
+    uint16_t len;
+    struct award_ranks_entry list[];
+} __attribute__((packed));
+
+struct req_award_claim {
+    uint16_t len;
+    uint16_t code;
+    uint16_t round;
+    uint16_t turn;
+    uint16_t vt_count;
+    // This is all gotten dynamically
+//    uint16_t vt_id;
+//    uint16_t data_size;
+//    uint8_t data[PILOT_DATA_SIZE];
+} __attribute__((packed));
+
+struct resp_award_claim {
+    uint16_t len;
+    uint16_t code;
+    uint8_t status;
+    uint32_t padding;
+    struct vt_list vts;
+} __attribute__((packed));
+
+struct resp_award_ranks {
+    uint16_t len;
+    uint16_t code;
+    uint8_t status;
+    uint32_t padding;
+    struct award_ranks_list ranks;
 } __attribute__((packed));
 
 struct req_trade_token {
@@ -428,27 +496,6 @@ struct req_trade_vt {
     // Both of these have variable length so decode them dynamically
 //    struct vt_list rx_vts;
 //    struct vt_list tx_vts;
-} __attribute__((packed));
-
-struct loc_mystery_entry {
-    uint16_t a;
-    uint16_t b;
-    uint32_t c; // Unused?
-    uint16_t d;
-    uint32_t e;
-    uint8_t f; // Faction?
-} __attribute__((packed)); // 15 bytes
-
-struct loc_mystery_list {
-    uint16_t len; // Should not exceed 128
-    struct loc_mystery_entry list[];
-} __attribute__((packed));
-
-struct resp_loc_mystery {
-    uint16_t len;
-    uint16_t code;
-    uint8_t status;
-    struct loc_mystery_list values;
 } __attribute__((packed));
 
 struct command_base cmd_liveness = {COMMAND_LEN(command_base), 0x1010};
@@ -648,20 +695,6 @@ void handle_turn_days(void) {
     
     sendcmd(&cmd_turn_days);
     logmsg("Response Turn Days: %d Days", cmd_turn_days.days);
-}
-
-void handle_loc_unknown(void) {
-    logmsg("Request LOC mystery command");
-    
-    size_t rowcount = 0;
-    struct resp_loc_mystery * loc_mystery = malloc(sizeof(struct resp_loc_mystery) + sizeof(struct loc_mystery_entry) * rowcount);
-    loc_mystery->code = 0x8041;
-    loc_mystery->status = 0;
-    loc_mystery->values.len = rowcount;
-    loc_mystery->len = COMMAND_LEN(resp_loc_mystery) + sizeof(struct loc_mystery_entry) * rowcount;
-
-    sendcmd(loc_mystery);
-    free(loc_mystery);
 }
 
 void handle_campaign_period(void) {
@@ -961,6 +994,20 @@ void handle_round_points(void) {
     }
     mysql_free_result(sqlres);
     
+    if (mysql_query(local_data->sqlcon, "SELECT round FROM settings ORDER BY round DESC, turn DESC LIMIT 1;")) {
+        logmsg("Failed to query current round for round points, got error: %s", mysql_error(local_data->sqlcon));
+        client_handler_exit(1);
+    }
+    
+    if (!(sqlres = mysql_store_result(local_data->sqlcon))) {
+        logmsg("Failed to get current round for round points, got error: %s", mysql_error(local_data->sqlcon));
+        client_handler_exit(1);
+    }
+    
+    MYSQL_ROW row = mysql_fetch_row(sqlres);
+    uint32_t round = strtoul(row[0], NULL, 10);
+    mysql_free_result(sqlres);
+    
     struct resp_round_points round_points = {COMMAND_LEN(resp_round_points), 0x2028};
     // TODO: Fetch this dynamically from the DB
     /*
@@ -969,7 +1016,7 @@ void handle_round_points(void) {
         2 = 2nd
         3 = 3rd
     */
-    round_points.points = 100000;
+    round_points.points = round_points_in->round == round ? 100000 : 0;
     round_points.hsd = 3;
     round_points.prf = 3;
     round_points.rb  = 3;
@@ -1868,7 +1915,7 @@ void handle_message_post(void) {
     sendcmd(&message_post);
 }
 
-void get_category_query(uint8_t category, char ** category_query, char ** category_filter) {
+void get_category_query(uint8_t category, uint16_t turn, char ** category_query, char ** category_filter) {
     switch (category) {
     case 0: {
         *category_query = "";
@@ -1876,7 +1923,7 @@ void get_category_query(uint8_t category, char ** category_query, char ** catego
     } break;
     case 1: { // Accuracy
         *category_query = "(SUM(stat1) * 1000) as score, SUM(stat2) as scoreDiv";
-        *category_filter = "scoreDiv >= 100";
+        *category_filter = turn ? "scoreDiv >= 50" : "scoreDiv >= 200";
     } break;
     case 3: { // Points for Enemies Destroyed
         *category_query = "SUM(stat4) as score, 1 as scoreDiv";
@@ -1884,7 +1931,7 @@ void get_category_query(uint8_t category, char ** category_query, char ** catego
     } break;
     case 5: { // Mission Victories
         *category_query = "(SUM(stat6) * 1000) as score, SUM(stat7) as scoreDiv";
-        *category_filter = "scoreDiv >= 5";
+        *category_filter = turn ? "scoreDiv >= 5" : "scoreDiv >= 20";
     } break;
     case 6: { // Number of Occupations
         *category_query = "SUM(stat8) as score, 1 as scoreDiv";
@@ -1923,7 +1970,7 @@ void handle_rank_count(uint32_t * count, uint32_t * place, uint16_t round, uint1
     if (faction) snprintf(faction_query, sizeof(faction_query), "AND faction = %d", faction);
 
     char * category_query, * category_filter;
-    get_category_query(category, &category_query, &category_filter);
+    get_category_query(category, turn, &category_query, &category_filter);
 
     char query[512];
     if (count) {
@@ -2089,11 +2136,11 @@ void handle_rank_values(void) {
     if (rank_values_in->faction) snprintf(faction_query, sizeof(faction_query), "AND leaderboard.faction = %d", rank_values_in->faction);
     
     char * category_query, * category_filter;
-    get_category_query(rank_values_in->category, &category_query, &category_filter);
+    get_category_query(rank_values_in->category, rank_values_in->turn, &category_query, &category_filter);
     
     char query[512];
     snprintf(query, sizeof(query),
-        "SELECT xname, pilot, FLOOR(score / scoreDiv) as res FROM (SELECT xuid, %s FROM leaderboard WHERE round = %d %s %s GROUP BY xuid) as lb INNER JOIN accounts ON lb.xuid = accounts.xuid WHERE %s ORDER BY res DESC LIMIT %d, %d;",
+        "SELECT xname, pilot, (score / scoreDiv) as res FROM (SELECT xuid, %s FROM leaderboard WHERE round = %d %s %s GROUP BY xuid) as lb INNER JOIN accounts ON lb.xuid = accounts.xuid WHERE %s ORDER BY res DESC LIMIT %d, %d;",
         category_query,
         rank_values_in->round,
         turn_query,
@@ -2141,9 +2188,11 @@ void handle_rank_values(void) {
         if (row[1]) memcpy(rank_values->ranks.list[i].name, row[1] + PILOT_NAME_OFFSET, PILOT_NAME_LEN);
         else bzero(rank_values->ranks.list[i].name, PILOT_NAME_LEN);
         
+        double score = row[2] ? strtod(row[2], NULL) : 0.0;
+        
         rank_values->ranks.list[i].rank = rank_values_in->start + i;
         rank_values->ranks.list[i].a = 0;
-        rank_values->ranks.list[i].score = row[2] ? strtoul(row[2], NULL, 10) : 0;
+        rank_values->ranks.list[i].score = score;
     }
 
     mysql_free_result(sqlres);
@@ -2154,20 +2203,360 @@ void handle_rank_values(void) {
 }
 
 void handle_awards_available(void) {
-    logmsg("Request awards available");
+    logmsg("Request awards available as faction: %s", get_faction(local_data->faction));
     
-    // TODO
+    if (!local_data->faction) {
+        struct resp_award_available * award_available = malloc(sizeof(struct resp_award_available));
+        award_available->code = 0x8041;
+        award_available->status = 1;
+        award_available->awards.len = 0;
+        award_available->len = COMMAND_LEN(resp_award_available);
+        
+        logmsg("Awards available response: Cannot accept awards while not assigned to a faction");
+        sendcmd(award_available);
+        free(award_available);
+        return;
+    }
     
-    size_t award_count = 0;
+    char query[256];
+    snprintf(query, sizeof(query),
+        "SELECT round, turn, rank1, rank2, rank3, rank4 FROM awards WHERE xuid = CONV('%016lX', 16, 10) ORDER BY round ASC, turn ASC LIMIT 128;",
+        local_data->xuid
+    );
+    
+    if (mysql_query(local_data->sqlcon, query)) {
+        logmsg("Failed to query available awards, got error: %s", mysql_error(local_data->sqlcon));
+        client_handler_exit(1);
+    }
+    
+    MYSQL_RES * sqlres;
+    if (!(sqlres = mysql_store_result(local_data->sqlcon))) {
+        logmsg("Failed to get available awards, got error: %s", mysql_error(local_data->sqlcon));
+        client_handler_exit(1);
+    }
+    
+    int num_fields = mysql_num_fields(sqlres);
+    if (num_fields != 6) {
+        logmsg("Incorrect number of fields (%d) in available awards", num_fields);
+        mysql_free_result(sqlres);
+        client_handler_exit(1);
+    }
+    
+    size_t award_count = mysql_num_rows(sqlres);
     struct resp_award_available * award_available = malloc(sizeof(struct resp_award_available) + sizeof(struct award_entry) * award_count);
-    award_available->code = 0x6041;
+    award_available->code = 0x8041;
     award_available->status = 0;
     award_available->awards.len = award_count;
     award_available->len = COMMAND_LEN(resp_award_available) + sizeof(struct award_entry) * award_count;
     
+    /*
+    HSD - Turn: 1 = Garpike, 2 = Behemoth, 3 = Malestrom
+    HSD - Round: 1 = Jug, 2 = Reg A, 3 = Reg N, 4-5 = Garpike, 6-7 = Behemoth, 8-10 = Malestrom
+    
+    PRF - Turn: 1 = M3, 2 = M2, 3 = Rapier
+    PRF - Round: 1 = Quasar, 2 = M3, 3 = M3, 4-7 = M2, 8-10 = Rapier
+    
+    RB  - Turn: 1-2 = Zug, 3 = Sheep
+    RB  - Round: 1 = Shaker, 2-5 = Zug, 6-10 = Sheep
+    
+    Jar - Turn: 1-3 = N-SR
+    Jar - Round: 1-3 = Macab, 4-10 = N-SR
+    */
+    
+    const int turn_awards[4][3] = {
+        {24, 21, 22}, // HSD
+        {12, 11, 14}, // PRF
+        {25, 25, 23}, // RB
+        {17, 17, 17}, // JAR
+    };
+    
+    const int round_awards[4][10] = {
+        { 3, 20, 19, 24, 24, 21, 21, 22, 22, 22}, // HSD
+        {15, 12, 12, 11, 11, 11, 11, 14, 14, 14}, // PRF
+        {29, 25, 25, 25, 25, 23, 23, 23, 23, 23}, // RB
+        {28, 28, 28, 17, 17, 17, 17, 17, 17, 17}, // JAR
+    };
+    
+    for (int i = 0; i < award_count; i++) {
+        MYSQL_ROW row = mysql_fetch_row(sqlres);
+
+        uint16_t round = strtoul(row[0], NULL, 10);
+        uint16_t turn  = strtoul(row[1], NULL, 10);
+        
+        uint32_t best_rank = UINT32_MAX;
+        for (int j = 2; j < 6; j++) {
+            if (!row[j]) continue;
+            uint32_t rank = strtoul(row[j], NULL, 10);
+            if (rank < best_rank) best_rank = rank;
+        }
+        
+        if (!best_rank || best_rank == UINT32_MAX) {
+            logmsg("WARNING: Award for round %d, turn %d had no valid ranks!", round, turn);
+            continue;
+        }
+        
+        uint16_t vt_id = 35; // This constant means no VT is awarded
+        if (turn >= 6) { // End of Turn Award
+            if (best_rank <= 3) {
+                vt_id = turn_awards[local_data->faction - 1][best_rank - 1];
+            }
+        } else if (!turn) { // End of Round Award
+            if (best_rank <= 10) {
+                vt_id = round_awards[local_data->faction - 1][best_rank - 1];
+            }
+        }
+        
+        award_available->awards.list[i].round = round;
+        award_available->awards.list[i].turn  = turn;
+        award_available->awards.list[i].a = 0;
+        award_available->awards.list[i].vt = vt_id;
+        award_available->awards.list[i].b = 0;
+        award_available->awards.list[i].faction = local_data->faction;
+    }
+    
+    mysql_free_result(sqlres);
+    
     logmsg("Awards available response: %d Awards", award_count);
     sendcmd(award_available);
     free(award_available);
+}
+
+void handle_awards_points(void) {
+    struct req_award_points * award_points_in = (struct req_award_points *)local_data->recvbuf;
+    logmsg("Request award points: %s", award_points_in->is_turn ? "Turn" : "Round");
+    
+    size_t point_count = award_points_in->is_turn ? 10 : 20;
+    struct resp_award_points * award_points_out = malloc(sizeof(struct resp_award_points) + sizeof(uint32_t) * point_count);
+    award_points_out->code = 0x204C;
+    award_points_out->status = 0;
+    award_points_out->points.len = point_count;
+    award_points_out->len = COMMAND_LEN(resp_award_points) + sizeof(uint32_t) * point_count;
+    
+    if (award_points_in->is_turn) {
+        for (int i = 0; i < point_count; i++) {
+            award_points_out->points.list[i] = 40000;
+        }
+    } else {
+        award_points_out->points.list[0] = 400000;
+        award_points_out->points.list[1] = 200000;
+        award_points_out->points.list[2] = 150000;
+        award_points_out->points.list[3] = 120000;
+        award_points_out->points.list[4] = 110000;
+        award_points_out->points.list[5] = 100000;
+        award_points_out->points.list[6] =  90000;
+        award_points_out->points.list[7] =  80000;
+        award_points_out->points.list[8] =  70000;
+        award_points_out->points.list[9] =  60000;
+        for (int i = 10; i < point_count; i++) {
+            award_points_out->points.list[i] = 50000;
+        }
+    }
+    
+    logmsg("Award points response: %d Points", point_count);
+    sendcmd(award_points_out);
+    free(award_points_out);
+}
+
+void handle_awards_ranks(void) {
+    struct req_award_ranks * award_ranks_in = (struct req_award_ranks *)local_data->recvbuf;
+    logmsg("Request award ranks: Round %d, Turn %d, Faction %s",
+        award_ranks_in->round, award_ranks_in->turn, get_faction(award_ranks_in->faction));
+
+    char query[256];
+    snprintf(query, sizeof(query),
+        "SELECT rank1, rank2, rank3, rank4 FROM awards WHERE round = %d AND turn = %d AND xuid = CONV('%016lX', 16, 10);",
+        award_ranks_in->round,
+        award_ranks_in->turn,
+        local_data->xuid
+    );
+    
+    if (mysql_query(local_data->sqlcon, query)) {
+        logmsg("Failed to query award ranks, got error: %s", mysql_error(local_data->sqlcon));
+        client_handler_exit(1);
+    }
+    
+    MYSQL_RES * sqlres;
+    if (!(sqlres = mysql_store_result(local_data->sqlcon))) {
+        logmsg("Failed to get award ranks, got error: %s", mysql_error(local_data->sqlcon));
+        client_handler_exit(1);
+    }
+    
+    int num_fields = mysql_num_fields(sqlres);
+    if (num_fields != 4) {
+        logmsg("Incorrect number of fields (%d) in award ranks", num_fields);
+        mysql_free_result(sqlres);
+        client_handler_exit(1);
+    }
+
+    MYSQL_ROW row = mysql_fetch_row(sqlres);
+
+    const uint32_t category_list[4] = {1, 3, 5, 6};
+    uint32_t categories[num_fields];
+    
+    uint32_t ranks_count = 0;
+    uint32_t ranks[num_fields];
+    for (int i = 0; i < num_fields; i++) {
+        if (!row[i]) continue;
+        ranks[ranks_count] = strtoul(row[i], NULL, 10);
+        categories[ranks_count] = category_list[i];
+        ranks_count++;
+    }
+    
+    mysql_free_result(sqlres);
+
+    struct resp_award_ranks * award_ranks_out = malloc(sizeof(struct resp_award_ranks) + sizeof(struct award_ranks_entry) * ranks_count);
+    award_ranks_out->code = 0x4062;
+    award_ranks_out->status = 0;
+    award_ranks_out->ranks.len = ranks_count;
+    award_ranks_out->len = COMMAND_LEN(resp_award_ranks) + sizeof(struct award_ranks_entry) * ranks_count;
+    
+    for (int i = 0; i < ranks_count; i++) {
+        award_ranks_out->ranks.list[i].category = categories[i];
+        award_ranks_out->ranks.list[i].rank = ranks[i];
+        award_ranks_out->ranks.list[i].a = 0;
+        award_ranks_out->ranks.list[i].b = 0;
+    }
+    
+    logmsg("Award ranks response: %d Ranks", ranks_count);
+    sendcmd(award_ranks_out);
+    free(award_ranks_out);
+}
+
+void handle_awards_claim(void) {
+    struct req_award_claim * award_claim_in = (struct req_award_claim *)local_data->recvbuf;
+    logmsg("Request award claim: Round %d, Turn %d, VT Count %d, Faction %s",
+        award_claim_in->round, award_claim_in->turn, award_claim_in->vt_count, get_faction(local_data->faction));
+
+    uint16_t * vt_list = (uint16_t *)(award_claim_in + 1);
+    uint16_t * pilot_data_size = vt_list + award_claim_in->vt_count;
+    uint8_t * pilot_data = (uint8_t *)(pilot_data_size + 1);
+
+    // This will tell us if the vt data and pilot data are correctly aligned
+    if (*pilot_data_size != PILOT_DATA_SIZE) {
+        struct resp_award_claim * award_claim_out = malloc(sizeof(struct resp_award_claim));
+        award_claim_out->code = 0x2048;
+        award_claim_out->status = 1;
+        award_claim_out->vts.len = 0;
+        award_claim_out->len = COMMAND_LEN(resp_award_claim);
+        
+        logmsg("Award claim response: Cannot claim award, pilot data size was %d not %d", *pilot_data_size, PILOT_DATA_SIZE);
+        sendcmd(award_claim_out);
+        free(award_claim_out);
+        return;
+    }
+    
+    char pilot_escape[2 * PILOT_DATA_SIZE + 1];
+    mysql_real_escape_string(local_data->sqlcon, pilot_escape, pilot_data, PILOT_DATA_SIZE);
+    
+    size_t query_max_len = 2 * PILOT_DATA_SIZE + 256;
+    char query[query_max_len];
+    size_t query_len = snprintf(query, query_max_len,
+        "UPDATE accounts SET pilot = '%s' WHERE xuid = CONV('%016lX', 16, 10);",
+        pilot_escape, local_data->xuid);
+    
+    if (mysql_real_query(local_data->sqlcon, query, query_len)) {
+        logmsg("Failed to update award claim user info, got error: %s", mysql_error(local_data->sqlcon));
+        client_handler_exit(1);
+    }
+    
+    if (!mysql_affected_rows(local_data->sqlcon)) {
+        logmsg("Did not update award claim user info, zero rows affected");
+        client_handler_exit(1);
+    }
+    
+    snprintf(query, query_max_len,
+        "DELETE FROM awards WHERE round = %d AND turn = %d AND xuid = CONV('%016lX', 16, 10);",
+        award_claim_in->round, award_claim_in->turn, local_data->xuid);
+    
+    if (mysql_query(local_data->sqlcon, query)) {
+        logmsg("Failed to delete award on claim, got error: %s", mysql_error(local_data->sqlcon));
+        client_handler_exit(1);
+    }
+    
+    if (!mysql_affected_rows(local_data->sqlcon)) {
+        logmsg("Did not delete award on claim, zero rows affected");
+        client_handler_exit(1);
+    }
+    
+    if (mysql_set_server_option(local_data->sqlcon, MYSQL_OPTION_MULTI_STATEMENTS_ON)) {
+        logmsg("Failed to enable multi-statement during awards claim, got error: %s",  mysql_error(local_data->sqlcon));
+        client_handler_exit(1);
+    }
+    
+    struct resp_award_claim * award_claim_out = malloc(sizeof(struct resp_award_claim) + sizeof(struct vt_entry) * award_claim_in->vt_count);
+    award_claim_out->code = 0x2048;
+    award_claim_out->status = 0;
+    
+    int vts_claimed = 0;
+    for (int i = 0; i < award_claim_in->vt_count; i++) {
+        uint16_t type = vt_list[i];
+        snprintf(query, query_max_len,
+            "BEGIN; SELECT serial FROM shop WHERE type = %d FOR UPDATE; UPDATE shop SET serial = serial + 1 WHERE type = %d; COMMIT;",
+            type, type);
+    
+        if (mysql_query(local_data->sqlcon, query)) {
+            logmsg("Failed to update serials in award claim, got error: %s", mysql_error(local_data->sqlcon));
+            client_handler_exit(1);
+        }
+        
+        // Skip the BEGIN statement
+        if (mysql_next_result(local_data->sqlcon) > 0) {
+            logmsg("Error while skipping first result from award claim list");
+            client_handler_exit(1);
+        }
+        
+        MYSQL_RES * sqlres;
+        if (!(sqlres = mysql_store_result(local_data->sqlcon))) {
+            logmsg("Failed to get serial number for award claim list, got error: %s", mysql_error(local_data->sqlcon));
+            client_handler_exit(1);
+        }
+        
+        int num_fields = mysql_num_fields(sqlres);
+        if (num_fields != 1) {
+            logmsg("Incorrect number of fields (%d) in award claim list", num_fields);
+            mysql_free_result(sqlres);
+            client_handler_exit(1);
+        }
+        
+        MYSQL_ROW row = mysql_fetch_row(sqlres);
+        if (!row || !row[0]) {
+            logmsg("Failed to get row from award claim list");
+            mysql_free_result(sqlres);
+            client_handler_exit(1);
+        }
+
+        uint32_t serial = strtoul(row[0], NULL, 10);
+        mysql_free_result(sqlres);
+        
+        int status;
+        do {
+            status = mysql_next_result(local_data->sqlcon);
+            if (status > 0) {
+                logmsg("Error while discarding extra results from award claim list");
+                client_handler_exit(1);
+            }
+        } while (!status);
+        
+        snprintf(query, query_max_len,
+            "INSERT INTO garage SET type = %d, serial = %d, faction = %d, xuid = CONV('%016lX', 16, 10);",
+            type, serial, local_data->faction, local_data->xuid);
+            
+        if (mysql_query(local_data->sqlcon, query)) {
+            logmsg("Failed to add VTs in award claim list, got error: %s", mysql_error(local_data->sqlcon));
+            client_handler_exit(1);
+        }
+        
+        award_claim_out->vts.list[vts_claimed].type = type;
+        award_claim_out->vts.list[vts_claimed].serial = serial;
+        vts_claimed++;
+    }
+    
+    award_claim_out->vts.len = vts_claimed;
+    award_claim_out->len = COMMAND_LEN(resp_award_claim) + sizeof(struct vt_entry) * vts_claimed;
+    
+    logmsg("Award claim response: %d VTs", vts_claimed);
+    sendcmd(award_claim_out);
+    free(award_claim_out);
 }
 
 void handle_trade_token(void) {
@@ -2497,15 +2886,16 @@ void * client_handler(void * client_fd) {
         case 0x1063: handle_rank_count_categories();break;
         
         // Awards
-        case 0x5041: handle_awards_available();     break;
+        case 0x7041: handle_awards_available();     break;
+        case 0x104C: handle_awards_points();        break;
+        case 0x3062: handle_awards_ranks();         break;
+        case 0x1048: handle_awards_claim();         break;
         
         // Trading
         case 0x104A: handle_trade_token();          break;
         case 0x104B: handle_trade_user_info();      break;
         case 0x1045: handle_trade_vt();             break;
-        
-        // Unknown Command
-        case 0x7041: handle_loc_unknown();          break;
+
         default:
             logmsg("Unknown request %04X, length %d", req->code, req->len);
             
@@ -2583,6 +2973,13 @@ unsigned int service_handler(MYSQL * sqlcon) {
         return 60;
     }
     
+    snprintf(service_query, sizeof(service_query), "CALL give_turn_award(%d, %d);", round, turn);
+    
+    if (mysql_query(sqlcon, service_query)) {
+        fprintf(stderr, "Failed to give out turn awards, got error: %s\n", mysql_error(sqlcon));
+        return 60;
+    }
+    
     bool faction_reset = false;
     
     if (turn < 8) {
@@ -2590,6 +2987,13 @@ unsigned int service_handler(MYSQL * sqlcon) {
         
         if (turn == 3 || turn == 5) faction_reset = true;
     } else {
+        snprintf(service_query, sizeof(service_query), "CALL give_round_award(%d);", round);
+        
+        if (mysql_query(sqlcon, service_query)) {
+            fprintf(stderr, "Failed to give out round awards, got error: %s\n", mysql_error(sqlcon));
+            return 60;
+        }
+        
         // Reset to defaults for new round
         faction_reset = true;
         round++;
