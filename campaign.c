@@ -1183,8 +1183,8 @@ void handle_fixed_message(void) {
         client_handler_exit(1);
     }
     
-    int round   = strtoul(row[0], NULL, 10);
-    int turn    = strtoul(row[1], NULL, 10);
+    unsigned int round = strtoul(row[0], NULL, 10);
+    unsigned int turn  = strtoul(row[1], NULL, 10);
     long period = strtoul(row[2], NULL, 10);
     
     mysql_free_result(sqlres);
@@ -1223,6 +1223,39 @@ void handle_fixed_message(void) {
         fixedmsg.msg[fixedmsg.msg_len++] = 7;
     } else if (turn == 5) {
         // Jar appears
+        fixedmsg.msg[fixedmsg.msg_len++] = 9;
+    }
+    
+    char query[256];
+    snprintf(query, sizeof(query), "SELECT COUNT(*) FROM awards WHERE xuid = CONV('%016lX', 16, 10);", local_data->xuid);
+    
+    if (mysql_query(local_data->sqlcon, query)) {
+        logmsg("Failed to query available awards for fixed message, got error: %s", mysql_error(local_data->sqlcon));
+        client_handler_exit(1);
+    }
+    
+    if (!(sqlres = mysql_store_result(local_data->sqlcon))) {
+        logmsg("Failed to get available awards for fixed message, got error: %s", mysql_error(local_data->sqlcon));
+        client_handler_exit(1);
+    }
+    
+    num_fields = mysql_num_fields(sqlres);
+    if (num_fields != 1) {
+        logmsg("Incorrect number of fields (%d) in available awards for fixed message", num_fields);
+        mysql_free_result(sqlres);
+        client_handler_exit(1);
+    }
+    
+    row = mysql_fetch_row(sqlres);
+    if (!row || !row[0]) {
+        logmsg("Failed to get row from available awards for fixed message, got error: %s", mysql_error(local_data->sqlcon));
+        mysql_free_result(sqlres);
+        client_handler_exit(1);
+    }
+    
+    unsigned int award_count = strtoul(row[0], NULL, 10);
+    
+    if (award_count > 0) {
         fixedmsg.msg[fixedmsg.msg_len++] = 10;
     }
 
