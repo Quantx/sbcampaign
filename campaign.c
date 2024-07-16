@@ -507,6 +507,8 @@ struct command_status cmd_wait = {COMMAND_LEN(command_status), 0x3015};
 #define TURN_DAYS 7
 #define DAY_SECONDS 86400
 #define TURN_SECONDS (TURN_DAYS * DAY_SECONDS)
+#define DROP_COUNT (4 * TURN_DAYS)
+#define DROP_INTERVAL (TURN_SECONDS / DROP_COUNT)
 #define NUMBER_OF_MAPS 24
 
 struct command_turn_days cmd_turn_days = {COMMAND_LEN(command_turn_days), 0x4030, TURN_DAYS};
@@ -2980,7 +2982,7 @@ unsigned int service_handler(MYSQL * sqlcon) {
             return 60;
         }
     
-        return TURN_SECONDS;
+        return DROP_INTERVAL;
     }
     
     uint16_t round = strtoul(row[0], NULL, 10);
@@ -2997,6 +2999,19 @@ unsigned int service_handler(MYSQL * sqlcon) {
     else strncpy(freemsg_jp, "null", sizeof(freemsg_jp));
     
     mysql_free_result(sqlres);
+    
+    // Preform shop drop
+    if (remaining > DROP_INTERVAL) {
+        snprintf(service_query, sizeof(service_query), "CALL shop_drop(%d, %d);", turn, DROP_COUNT);
+    
+        if (mysql_query(sqlcon, service_query)) {
+            fprintf(stderr, "Failed to preform shop drop, got error: %s\n", mysql_error(sqlcon));
+            return 60;
+        }
+        
+        printf("Randomly adding VT drops to the shop");
+        return DROP_INTERVAL;
+    }
     
     // Wait for period to expire
     if (remaining > 0) return remaining + 1;
@@ -3051,7 +3066,7 @@ unsigned int service_handler(MYSQL * sqlcon) {
         return 60;
     }
 
-    return TURN_SECONDS;
+    return DROP_INTERVAL;
 }
 
 void service_handle_cleanup(void * _) {
