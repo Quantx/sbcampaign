@@ -3009,7 +3009,7 @@ unsigned int service_handler(MYSQL * sqlcon) {
             return 60;
         }
         
-        printf("Randomly adding VT drops to the shop");
+        printf("Randomly adding VT drops to the shop\n");
         return DROP_INTERVAL;
     }
     
