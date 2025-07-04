@@ -72,6 +72,15 @@ struct resp_vt_potential_cost {
     struct vt_potential_cost_entry costs[];
 } __attribute__((packed));
 
+#define MISSION_LIST_LEN 27
+struct resp_mission_list {
+    uint16_t len;
+    uint16_t code;
+    uint8_t status;
+    uint16_t missions_len; // MUST BE 0 OR 27
+    int8_t missions[MISSION_LIST_LEN]; // Entries 24 and 26 should be -1
+} __attribute__((packed));
+
 struct req_freemsg {
     uint16_t len;
     uint16_t code;
@@ -681,6 +690,30 @@ void * recvcmd(void) {
     return cmd;
 }
 
+// NOTE: This is for modded clients, no official copy of the game will issue this command.
+void handle_mission_list(void) {
+    logmsg("Request mission list");
+    
+    struct resp_mission_list mission_list = {
+        COMMAND_LEN(resp_mission_list),
+        0x20FF,
+        0,
+        7,
+    };
+    
+    for (int8_t i = 0; i < MISSION_LIST_LEN; i++) {
+        mission_list.missions[i] = i;
+    }
+    
+    // Make the list match what's in game
+    mission_list.missions[25] = mission_list.missions[24];
+    mission_list.missions[24] = -1;
+    mission_list.missions[26] = -1;
+    
+    logmsg("Response mission list: %d Missions", mission_list.missions_len);
+    sendcmd(&mission_list);
+}
+
 void handle_turn_days(void) {
     logmsg("Request Turn Days");
     
@@ -782,7 +815,7 @@ void handle_vt_potential_cost(void) {
     
     size_t rowcount = mysql_num_rows(sqlres);
     */
-    size_t rowcount = 28;
+    size_t rowcount = 0;
     struct resp_vt_potential_cost * potentialcost = malloc(sizeof(struct resp_vt_potential_cost) + sizeof(struct vt_potential_cost_entry) * rowcount);
     potentialcost->code = 0x2049;
     potentialcost->status = 0;
@@ -2356,35 +2389,40 @@ void handle_awards_available(void) {
     free(award_available);
 }
 
+uint32_t turn_points[] = {
+    [0 ... 9] = 40000
+};
+uint32_t round_points[] = {
+    [0] = 400000,
+    [1] = 200000,
+    [2] = 150000,
+    [3] = 120000,
+    [4] = 110000,
+    [5] = 100000,
+    [6] = 90000,
+    [7] = 80000,
+    [8] = 70000,
+    [9] = 60000,
+    [10 ... 19] = 50000,
+};
+
 void handle_awards_points(void) {
     struct req_award_points * award_points_in = (struct req_award_points *)local_data->recvbuf;
     logmsg("Request award points: %s", award_points_in->is_turn ? "Turn" : "Round");
     
-    size_t point_count = award_points_in->is_turn ? 10 : 20;
+    uint32_t * point_list = award_points_in->is_turn ? turn_points : round_points;
+    size_t point_count = (award_points_in->is_turn ? sizeof(turn_points) : sizeof(round_points)) / sizeof(uint32_t);
+    
+    point_count = 0; // Disable points for now
+    
     struct resp_award_points * award_points_out = malloc(sizeof(struct resp_award_points) + sizeof(uint32_t) * point_count);
     award_points_out->code = 0x204C;
     award_points_out->status = 0;
     award_points_out->points.len = point_count;
     award_points_out->len = COMMAND_LEN(resp_award_points) + sizeof(uint32_t) * point_count;
     
-    if (award_points_in->is_turn) {
-        for (int i = 0; i < point_count; i++) {
-            award_points_out->points.list[i] = 40000;
-        }
-    } else {
-        award_points_out->points.list[0] = 400000;
-        award_points_out->points.list[1] = 200000;
-        award_points_out->points.list[2] = 150000;
-        award_points_out->points.list[3] = 120000;
-        award_points_out->points.list[4] = 110000;
-        award_points_out->points.list[5] = 100000;
-        award_points_out->points.list[6] =  90000;
-        award_points_out->points.list[7] =  80000;
-        award_points_out->points.list[8] =  70000;
-        award_points_out->points.list[9] =  60000;
-        for (int i = 10; i < point_count; i++) {
-            award_points_out->points.list[i] = 50000;
-        }
+    for (int i = 0; i < point_count; i++) {
+        award_points_out->points.list[i] = point_list[i];
     }
     
     logmsg("Award points response: %d Points", point_count);
@@ -2881,6 +2919,7 @@ void * client_handler(void * client_fd) {
         case 0x1031: handle_war_tide();             break;
         case 0x1032: handle_war_influence();        break;
         case 0x1028: handle_round_points();         break;
+        case 0x10FF: handle_mission_list();         break;
         
         // Mission Management
         case 0x1090: handle_analyze();              break;
