@@ -2389,10 +2389,10 @@ void handle_awards_available(void) {
     free(award_available);
 }
 
-uint32_t turn_points[] = {
+const uint32_t turn_points[] = {
     [0 ... 9] = 40000
 };
-uint32_t round_points[] = {
+const uint32_t round_points[] = {
     [0] = 400000,
     [1] = 200000,
     [2] = 150000,
@@ -2410,10 +2410,8 @@ void handle_awards_points(void) {
     struct req_award_points * award_points_in = (struct req_award_points *)local_data->recvbuf;
     logmsg("Request award points: %s", award_points_in->is_turn ? "Turn" : "Round");
     
-    uint32_t * point_list = award_points_in->is_turn ? turn_points : round_points;
+    const uint32_t * point_list = award_points_in->is_turn ? turn_points : round_points;
     size_t point_count = (award_points_in->is_turn ? sizeof(turn_points) : sizeof(round_points)) / sizeof(uint32_t);
-    
-    point_count = 0; // Disable points for now
     
     struct resp_award_points * award_points_out = malloc(sizeof(struct resp_award_points) + sizeof(uint32_t) * point_count);
     award_points_out->code = 0x204C;
@@ -2422,7 +2420,9 @@ void handle_awards_points(void) {
     award_points_out->len = COMMAND_LEN(resp_award_points) + sizeof(uint32_t) * point_count;
     
     for (int i = 0; i < point_count; i++) {
-        award_points_out->points.list[i] = point_list[i];
+        award_points_out->points.list[i] = 0;
+        // Disable points for now
+        //award_points_out->points.list[i] = point_list[i];
     }
     
     logmsg("Award points response: %d Points", point_count);
