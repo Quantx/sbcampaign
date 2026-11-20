@@ -1,0 +1,30 @@
+[campaign]
+motd_en = """Play full matches every weekend at:
+discord.gg/steelbattalion"""
+motd_ja = """毎週末、discord.gg/steelbattalion
+でフルマッチをプレイしてください"""
+
+round_end_points = 100000
+
+turn_points = [4000, 4000, 4000, 4000, 4000, 4000, 4000, 4000, 4000, 4000]
+round_points = [40000, 20000, 15000, 12000, 12000, 10000, 9000, 8000, 7000, 6000, 5000, 5000, 5000, 5000, 5000, 5000, 5000, 5000, 5000, 5000]
+
+hsd_turn_awards = [24, 21, 22]
+prf_turn_awards = [12, 11, 14]
+rb_turn_awards  = [25, 25, 23]
+jar_turn_awards = [17, 17, 17]
+
+hsd_round_awards = [ 3, 20, 19, 24, 24, 21, 21, 22, 22, 22]
+prf_round_awards = [15, 12, 12, 11, 11, 11, 11, 14, 14, 14]
+rb_round_awards  = [29, 25, 25, 25, 25, 23, 23, 23, 23, 23]
+jar_round_awards = [28, 28, 28, 17, 17, 17, 17, 17, 17, 17]
+
+shop_drop_count = 28
+
+[network]
+bind_port = 23457
+
+[database]
+username = "sbcampaign"
+app_name = "LoC Campaign"
+database = "loc_campaign"
