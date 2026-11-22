@@ -945,7 +945,7 @@ pub async fn shop_list(client: &mut Client) -> CommandResult {
         vtstock: Option<i16>,
     }
 
-    let shop_cost_stocks: Vec<ShopCostStock> = sqlx::query_as("SELECT \"type\", \"cost\", vtstock FROM shop WHERE (faction = $1) AND COALESCE(vtstock, 1) > 0 AND turn <= (SELECT turn FROM settings ORDER BY round DESC, turn DESC LIMIT 1)").bind(client.faction).fetch_all(pg).await?;
+    let shop_cost_stocks: Vec<ShopCostStock> = sqlx::query_as("SELECT \"type\", \"cost\", vtstock FROM shop WHERE faction = $1 AND COALESCE(vtstock, 1) > 0 AND turn <= (SELECT turn FROM settings ORDER BY round DESC, turn DESC LIMIT 1)").bind(client.faction).fetch_all(pg).await?;
 
     let mut shop_list: ShopEntryList = Vec::with_capacity(shop_cost_stocks.len());
 
@@ -1351,26 +1351,12 @@ pub async fn award_claim(
     vt_list_in: VTIDList,
     pilot_data: PilotData,
 ) -> CommandResult {
-    let mut vt_add_counts: HashMap<VTID, u16> = HashMap::with_capacity(35);
-
-    // Count the number of each VT type to add
-    for &id in vt_list_in.iter() {
-        *vt_add_counts.entry(id).or_insert(0) += 1;
-    }
-
     let pg = get_pool();
-
-    #[derive(sqlx::FromRow)]
-    struct ShopSerial {
-        #[sqlx(rename = "type")]
-        id: i16,
-        serial: i64,
-    }
 
     let mut transaction = pg.begin().await?;
 
     // Claim the award
-    sqlx::query("DELETE FROM awards WHERE round = $2 AND turn = $3 AND xuid = $1")
+    sqlx::query("DELETE FROM awards WHERE xuid = $1 AND round = $2 AND turn = $3")
         .bind(client.xuid)
         .bind(round as i16)
         .bind(turn as i16)
@@ -1384,34 +1370,50 @@ pub async fn award_claim(
         .execute(&mut *transaction)
         .await?;
 
-    // Fetch all relevant VT entries from the shop and lock them to prevent duplicate VTs from being created
-    let mut shop_query_builder: QueryBuilder<Postgres> =
-        QueryBuilder::new("SELECT \"type\", \"serial\" FROM shop WHERE \"type\" IN (");
-
-    let mut shop_query_separated = shop_query_builder.separated(", ");
-    for &id in vt_list_in.iter() {
-        shop_query_separated.push_bind(id as i16);
-    }
-    shop_query_separated.push_unseparated(") FOR UPDATE");
-
-    let shop_query = shop_query_builder.build_query_as::<ShopSerial>();
-    let shop_serial_stocks = shop_query.fetch_all(&mut *transaction).await?;
-
+    // Only update VTs if requested
     let mut vt_list = Vec::new();
-    for serial_stocks in shop_serial_stocks.iter() {
-        let count = vt_add_counts[&(serial_stocks.id as u16)];
+    if !vt_list_in.is_empty() {
+        let mut vt_add_counts: HashMap<VTID, u16> = HashMap::with_capacity(35);
 
-        // Update the serial number in the shop
-        sqlx::query("UPDATE shop SET \"serial\" = \"serial\" + $2 WHERE type = $1")
-            .bind(serial_stocks.id)
-            .bind(count as i64)
-            .execute(&mut *transaction)
-            .await?;
+        // Count the number of each VT type to add
+        for &id in vt_list_in.iter() {
+            *vt_add_counts.entry(id).or_insert(0) += 1;
+        }
 
-        // Insert the new VTs into the garage
-        for i in 0..count {
-            let serial = serial_stocks.serial + i as i64;
-            sqlx::query(
+        #[derive(sqlx::FromRow)]
+        struct ShopSerial {
+            #[sqlx(rename = "type")]
+            id: i16,
+            serial: i64,
+        }
+
+        // Fetch all relevant VT entries from the shop and lock them to prevent duplicate VTs from being created
+        let mut shop_query_builder: QueryBuilder<Postgres> =
+            QueryBuilder::new("SELECT \"type\", \"serial\" FROM shop WHERE \"type\" IN (");
+
+        let mut shop_query_separated = shop_query_builder.separated(", ");
+        for &id in vt_list_in.iter() {
+            shop_query_separated.push_bind(id as i16);
+        }
+        shop_query_separated.push_unseparated(") FOR UPDATE");
+
+        let shop_query = shop_query_builder.build_query_as::<ShopSerial>();
+        let shop_serial_stocks = shop_query.fetch_all(&mut *transaction).await?;
+
+        for serial_stocks in shop_serial_stocks.iter() {
+            let count = vt_add_counts[&(serial_stocks.id as u16)];
+
+            // Update the serial number in the shop
+            sqlx::query("UPDATE shop SET \"serial\" = \"serial\" + $2 WHERE type = $1")
+                .bind(serial_stocks.id)
+                .bind(count as i64)
+                .execute(&mut *transaction)
+                .await?;
+
+            // Insert the new VTs into the garage
+            for i in 0..count {
+                let serial = serial_stocks.serial + i as i64;
+                sqlx::query(
                 "INSERT INTO garage (xuid, \"type\", \"serial\", faction) VALUES ($1, $2, $3, $4)",
             )
             .bind(client.xuid)
@@ -1421,10 +1423,11 @@ pub async fn award_claim(
             .execute(&mut *transaction)
             .await?;
 
-            vt_list.push(VTEntry {
-                id: serial_stocks.id as u16,
-                serial: serial as u32,
-            });
+                vt_list.push(VTEntry {
+                    id: serial_stocks.id as u16,
+                    serial: serial as u32,
+                });
+            }
         }
     }
 
